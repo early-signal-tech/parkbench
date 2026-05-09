@@ -35,7 +35,7 @@ detect_platform() {
                     PLATFORM="darwin-amd64"
                     ;;
                 *)
-                    echo -e "${RED}✗ Unsupported macOS architecture: $ARCH${NC}"
+                    echo -e "${RED}✗ Unsupported macOS architecture: $ARCH${NC}" >&2
                     exit 1
                     ;;
             esac
@@ -49,18 +49,18 @@ detect_platform() {
                     PLATFORM="linux-arm64"
                     ;;
                 *)
-                    echo -e "${RED}✗ Unsupported Linux architecture: $ARCH${NC}"
+                    echo -e "${RED}✗ Unsupported Linux architecture: $ARCH${NC}" >&2
                     exit 1
                     ;;
             esac
             ;;
         *)
-            echo -e "${RED}✗ Unsupported OS: $OS${NC}"
+            echo -e "${RED}✗ Unsupported OS: $OS${NC}" >&2
             exit 1
             ;;
     esac
     
-    echo -e "${GREEN}✓ Detected platform: $PLATFORM${NC}"
+    echo -e "${GREEN}✓ Detected platform: $PLATFORM${NC}" >&2
 }
 
 # Get latest release version
@@ -68,7 +68,7 @@ get_latest_version() {
     if command -v curl &> /dev/null; then
         LATEST=$(curl -s "https://api.github.com/repos/$GITHUB_REPO/releases/latest" | grep '"tag_name"' | cut -d'"' -f4)
         if [ -z "$LATEST" ]; then
-            echo -e "${YELLOW}⚠ Could not fetch latest version, using v1.0.0${NC}"
+            echo -e "${YELLOW}⚠ Could not fetch latest version, using v1.0.0${NC}" >&2
             LATEST="v1.0.0"
         fi
     else
@@ -83,10 +83,10 @@ download_binary() {
     local tmp_dir=$(mktemp -d)
     local tmp_file="$tmp_dir/parkbench"
     
-    echo -e "${YELLOW}⬇ Downloading parkbench $VERSION for $PLATFORM...${NC}"
+    echo -e "${YELLOW}⬇ Downloading parkbench $VERSION for $PLATFORM...${NC}" >&2
     
     if ! curl -fsSL "$url" -o "$tmp_file"; then
-        echo -e "${RED}✗ Failed to download from $url${NC}"
+        echo -e "${RED}✗ Failed to download from $url${NC}" >&2
         rm -rf "$tmp_dir"
         exit 1
     fi
@@ -104,13 +104,13 @@ install_binary() {
     # Check if we need sudo
     if [ -w "$INSTALL_PATH" ]; then
         cp "$tmp_file" "$INSTALL_PATH/$BINARY_NAME"
-        echo -e "${GREEN}✓ Installed to $INSTALL_PATH/$BINARY_NAME${NC}"
+        echo -e "${GREEN}✓ Installed to $INSTALL_PATH/$BINARY_NAME${NC}" >&2
     else
         if sudo -n true 2>/dev/null; then
             sudo cp "$tmp_file" "$INSTALL_PATH/$BINARY_NAME"
-            echo -e "${GREEN}✓ Installed to $INSTALL_PATH/$BINARY_NAME (via sudo)${NC}"
+            echo -e "${GREEN}✓ Installed to $INSTALL_PATH/$BINARY_NAME (via sudo)${NC}" >&2
         else
-            echo -e "${RED}✗ Permission denied. Need sudo to write to $INSTALL_PATH${NC}"
+            echo -e "${RED}✗ Permission denied. Need sudo to write to $INSTALL_PATH${NC}" >&2
             exit 1
         fi
     fi
@@ -122,24 +122,24 @@ install_binary() {
 # Verify installation
 verify_installation() {
     if command -v parkbench &> /dev/null; then
-        echo -e "${GREEN}✓ Installation verified!${NC}"
-        parkbench --help | head -3
+        echo -e "${GREEN}✓ Installation verified!${NC}" >&2
+        parkbench --help | head -3 >&2
     else
         # Try the install path directly
         if [ -x "$INSTALL_PATH/$BINARY_NAME" ]; then
-            echo -e "${GREEN}✓ Installation verified!${NC}"
-            "$INSTALL_PATH/$BINARY_NAME" --help | head -3
+            echo -e "${GREEN}✓ Installation verified!${NC}" >&2
+            "$INSTALL_PATH/$BINARY_NAME" --help | head -3 >&2
         else
-            echo -e "${YELLOW}⚠ Binary installed but not in PATH${NC}"
-            echo -e "  Add $INSTALL_PATH to your PATH or run: $INSTALL_PATH/$BINARY_NAME${NC}"
+            echo -e "${YELLOW}⚠ Binary installed but not in PATH${NC}" >&2
+            echo -e "  Add $INSTALL_PATH to your PATH or run: $INSTALL_PATH/$BINARY_NAME${NC}" >&2
         fi
     fi
 }
 
 # Main
 main() {
-    echo -e "${GREEN}parkbench installer${NC}"
-    echo ""
+    echo -e "${GREEN}parkbench installer${NC}" >&2
+    echo "" >&2
     
     # Detect platform
     detect_platform
@@ -148,7 +148,7 @@ main() {
     if [ "$VERSION" = "latest" ]; then
         VERSION=$(get_latest_version)
     fi
-    echo -e "${GREEN}✓ Using version: $VERSION${NC}"
+    echo -e "${GREEN}✓ Using version: $VERSION${NC}" >&2
     
     # Download
     tmp_file=$(download_binary)
@@ -157,11 +157,11 @@ main() {
     install_binary "$tmp_file"
     
     # Verify
-    echo ""
+    echo "" >&2
     verify_installation
     
-    echo ""
-    echo -e "${GREEN}✓ parkbench installed successfully!${NC}"
+    echo "" >&2
+    echo -e "${GREEN}✓ parkbench installed successfully!${NC}" >&2
 }
 
 main
