@@ -25,9 +25,9 @@ jobs:
             artifact: parkbench-windows-amd64.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.1.7
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.24.0'
 
@@ -38,7 +38,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.3.1
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -50,13 +50,13 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.1.7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.1.7
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             parkbench-darwin-arm64/parkbench-darwin-arm64
