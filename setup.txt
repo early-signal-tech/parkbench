@@ -1,0 +1,42 @@
+-- Start Postgres and create the metadata database
+-- brew services start postgresql@18
+-- psql -d postgres -c "DROP DATABASE IF EXISTS ducklake_v1;"
+-- psql -d postgres -c "CREATE DATABASE ducklake_v1;"
+
+-- Start DuckDB CLI
+duckdb
+
+-- Install and load the ducklake extension
+INSTALL ducklake;
+LOAD ducklake;
+
+-- Attach a Postgres-backed DuckLake catalog
+-- DATA_PATH is where Parquet files are written
+ATTACH 'ducklake:postgres:dbname=ducklake_v1 host=localhost' AS wh
+    (DATA_PATH './ducklake_data', AUTOMATIC_MIGRATION TRUE);
+
+-- Create simple schema table
+CREATE TABLE wh.events (
+    id          INTEGER,
+    ts          TIMESTAMP,
+    event_type  VARCHAR
+);
+
+-- Create rich schema table
+CREATE TABLE wh.events_rich (
+    id          INTEGER,
+    user_id     VARCHAR,
+    event_type  VARCHAR,
+    ts          TIMESTAMP,
+    payload     JSON,
+    metadata    JSON
+);
+
+-- Verify tables were created
+SHOW TABLES FROM wh;
+
+-- Check DuckLake settings
+SELECT * FROM ducklake_settings('wh');
+
+-- Exit when done
+.exit

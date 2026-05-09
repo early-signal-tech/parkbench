@@ -1,0 +1,29 @@
+# Go binaries and build artifacts
+parkbench
+*.exe
+*.dll
+*.dylib
+*.o
+*.a
+*.so
+
+# Go mod/sum cache
+/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# DuckLake data
+ducklake_data/
+
+# DuckLake state
+.flush_state.json
+
+# Temporary files
+*.tmp
+*.log
