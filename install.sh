@@ -8,7 +8,7 @@
 
 set -e
 
-# Configuration
+# Configuration (v2)
 VERSION="${1:-latest}"
 INSTALL_PATH="${2:-/usr/local/bin}"
 BINARY_NAME="parkbench"
