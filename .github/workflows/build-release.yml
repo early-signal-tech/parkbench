@@ -43,12 +43,15 @@ jobs:
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4.1.7
+        with:
+          path: ./artifacts
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            parkbench-darwin-arm64/parkbench-darwin-arm64
-            parkbench-windows-amd64.exe/parkbench-windows-amd64.exe
-          draft: false
-          prerelease: false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            ./artifacts/parkbench-darwin-arm64/parkbench-darwin-arm64 \
+            ./artifacts/parkbench-windows-amd64.exe/parkbench-windows-amd64.exe \
+            --draft=false \
+            --prerelease=false
