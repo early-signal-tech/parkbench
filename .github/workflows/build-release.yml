@@ -1,0 +1,66 @@
+name: Build and Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            artifact: parkbench-darwin-arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            artifact: parkbench-darwin-amd64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            artifact: parkbench-windows-amd64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v4
+        with:
+          go-version: '1.24.0'
+
+      - name: Build binary
+        run: go build -o ${{ matrix.artifact }} .
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            parkbench-darwin-arm64/parkbench-darwin-arm64
+            parkbench-darwin-amd64/parkbench-darwin-amd64
+            parkbench-windows-amd64.exe/parkbench-windows-amd64.exe
+          draft: false
+          prerelease: false

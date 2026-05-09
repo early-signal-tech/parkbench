@@ -2,6 +2,61 @@
 
 A high-performance CLI tool for benchmarking DuckLake catalog inserts with flexible path handling and multiple run modes.
 
+## Quick Install
+
+Download and run the installer script in one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/early-signal-tech/parkbench/main/install.sh | bash
+```
+
+**Or with a specific version:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/early-signal-tech/parkbench/main/install.sh | bash -s v1.0.0
+```
+
+**Or to a custom location:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/early-signal-tech/parkbench/main/install.sh | bash -s latest /opt/parkbench
+```
+
+The installer will:
+
+- Detect your OS and architecture automatically
+- Download the latest binary from GitHub releases
+- Install to `/usr/local/bin/parkbench` (or your custom path)
+- Verify the installation works
+
+## Installation
+
+### Manual Installation
+
+**macOS (Apple Silicon / ARM64):**
+```bash
+curl -L https://github.com/early-signal-tech/parkbench/releases/download/v1.0.0/parkbench-darwin-arm64 | sudo install -m 755 /dev/stdin /usr/local/bin/parkbench
+parkbench --help
+```
+
+**macOS (Intel / AMD64):**
+```bash
+curl -L https://github.com/early-signal-tech/parkbench/releases/download/v1.0.0/parkbench-darwin-amd64 | sudo install -m 755 /dev/stdin /usr/local/bin/parkbench
+parkbench --help
+```
+
+**Windows (AMD64) - PowerShell (Admin):**
+```powershell
+$url = "https://github.com/early-signal-tech/parkbench/releases/download/v1.0.0/parkbench-windows-amd64.exe"
+$installPath = "$env:ProgramFiles\parkbench\parkbench.exe"
+New-Item -ItemType Directory -Force -Path "$env:ProgramFiles\parkbench" | Out-Null
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Invoke-WebRequest -Uri $url -OutFile $installPath
+$env:Path += ";$env:ProgramFiles\parkbench"
+[Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::User)
+parkbench --help
+```
+
 ## Quick Start
 
 ### Setup a new catalog

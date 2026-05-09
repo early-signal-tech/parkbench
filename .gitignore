@@ -1,5 +1,6 @@
 # Go binaries and build artifacts
 parkbench
+parkbench-*
 *.exe
 *.dll
 *.dylib
