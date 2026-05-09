@@ -106,11 +106,13 @@ install_binary() {
         cp "$tmp_file" "$INSTALL_PATH/$BINARY_NAME"
         echo -e "${GREEN}✓ Installed to $INSTALL_PATH/$BINARY_NAME${NC}" >&2
     else
-        if sudo -n true 2>/dev/null; then
-            sudo cp "$tmp_file" "$INSTALL_PATH/$BINARY_NAME"
-            echo -e "${GREEN}✓ Installed to $INSTALL_PATH/$BINARY_NAME (via sudo)${NC}" >&2
+        # Need sudo - this will prompt for password if needed
+        echo -e "${YELLOW}📝 Sudo password required to write to $INSTALL_PATH${NC}" >&2
+        sudo cp "$tmp_file" "$INSTALL_PATH/$BINARY_NAME"
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✓ Installed to $INSTALL_PATH/$BINARY_NAME${NC}" >&2
         else
-            echo -e "${RED}✗ Permission denied. Need sudo to write to $INSTALL_PATH${NC}" >&2
+            echo -e "${RED}✗ Failed to install. Permission denied.${NC}" >&2
             exit 1
         fi
     fi
