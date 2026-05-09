@@ -12,16 +12,8 @@ jobs:
       matrix:
         include:
           - os: macos-latest
-            goos: darwin
-            goarch: arm64
             artifact: parkbench-darwin-arm64
-          - os: macos-latest
-            goos: darwin
-            goarch: amd64
-            artifact: parkbench-darwin-amd64
           - os: windows-latest
-            goos: windows
-            goarch: amd64
             artifact: parkbench-windows-amd64.exe
 
     steps:
@@ -33,9 +25,6 @@ jobs:
 
       - name: Build binary
         run: go build -o ${{ matrix.artifact }} .
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4.3.1
@@ -60,7 +49,6 @@ jobs:
         with:
           files: |
             parkbench-darwin-arm64/parkbench-darwin-arm64
-            parkbench-darwin-amd64/parkbench-darwin-amd64
             parkbench-windows-amd64.exe/parkbench-windows-amd64.exe
           draft: false
           prerelease: false
