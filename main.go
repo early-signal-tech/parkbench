@@ -6,7 +6,7 @@
 // Schema Modes:
 //
 //	simple — {id, ts, event_type}
-//	rich   — {id, user_id, event_type, ts, payload JSON, metadata JSON}
+//	rich   — {id, user_id, event_type, ts, payload VARIANT, metadata VARIANT}
 //
 // Run Modes:
 //
@@ -135,13 +135,13 @@ func batchSQLRich(fqt string, startID, batchSize int) string {
 				'page':        (%s)[1 + (random() * %d)::INT],
 				'duration_ms': (100 + (random() * 9900)::INT),
 				'value':       round(random() * 499.99 + 0.01, 2)
-			}::JSON                                                              AS payload,
+			}::VARIANT                                                           AS payload,
 			{
 				'source':      (%s)[1 + (random() * %d)::INT],
 				'country':     (%s)[1 + (random() * %d)::INT],
 				'session_id':  'sess_' || (1 + (random() * 999999)::BIGINT)::VARCHAR,
 				'ab_variant':  CASE WHEN random() > 0.5 THEN 'A' ELSE 'B' END
-			}::JSON                                                              AS metadata
+			}::VARIANT                                                           AS metadata
 		FROM range(%d)`,
 		fqt, startID,
 		sqlArray(eventTypes), len(eventTypes)-1,
@@ -179,13 +179,13 @@ func tickerSQLRich(fqt string, id int) string {
 				'page':        %s,
 				'duration_ms': %d,
 				'value':       %.2f
-			}::JSON,
+			}::VARIANT,
 			{
 				'source':      %s,
 				'country':     %s,
 				'session_id':  'sess_' || (%d)::VARCHAR,
 				'ab_variant':  '%s'
-			}::JSON
+			}::VARIANT
 		)`,
 		fqt,
 		id,
@@ -344,8 +344,8 @@ const richDDL = `CREATE TABLE IF NOT EXISTS %s (
 	user_id     VARCHAR,
 	event_type  VARCHAR,
 	ts          TIMESTAMP,
-	payload     JSON,
-	metadata    JSON
+	payload     VARIANT,
+	metadata    VARIANT
 )`
 
 // ── run loops ──────────────────────────────────────────────────────────────
@@ -730,7 +730,7 @@ and re-runs setup to create fresh tables. Prompts for confirmation unless --forc
 Modes:
   Schema modes (simple, rich):
     simple  — {id, ts, event_type}
-    rich    — {id, user_id, event_type, ts, payload JSON, metadata JSON}
+    rich    — {id, user_id, event_type, ts, payload VARIANT, metadata VARIANT}
 
   Run modes (batch, ticker):
     batch   — Inserts large batches of rows (default)
