@@ -261,7 +261,7 @@ func printStats(
 	cumulative int64,
 	elapsedTotal float64,
 	s storageStats,
-	checkpointInfo string,
+	flushInfo string,
 ) {
 	throughput := 0.0
 	if batchSecs > 0 {
@@ -294,8 +294,8 @@ func printStats(
 	row("Batch throughput", fmt.Sprintf("%s rows/sec", commas(int64(throughput))))
 	row("Overall throughput", fmt.Sprintf("%s rows/sec", commas(int64(overall))))
 	row("Total rows (COUNT)", commas(s.total))
-	if checkpointInfo != "" {
-		row("Last CHECKPOINT", checkpointInfo)
+	if flushInfo != "" {
+		row("Last flush to Parquet", flushInfo)
 	}
 
 	fmt.Printf("%s╰────────────────────────────────────────────────────╯%s\n", cyan+bold, reset)
@@ -490,10 +490,10 @@ func runBatchMode(
 	}
 
 	var (
-		cumulative     int64
-		startTotal     = time.Now()
-		checkpointInfo string
-		batchNum       int
+		cumulative int64
+		startTotal = time.Now()
+		flushInfo  string
+		batchNum   int
 	)
 
 	runForever := numBatches == 0
@@ -521,16 +521,16 @@ loop:
 		elapsedTotal := time.Since(startTotal).Seconds()
 
 		if checkpointInterval > 0 && batchNum%checkpointInterval == 0 {
-			ck0 := time.Now()
-			if _, err := db.Exec("CHECKPOINT"); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: CHECKPOINT failed: %v\n", err)
+			f0 := time.Now()
+			if _, err := db.Exec(fmt.Sprintf("CALL ducklake_flush_inlined_data('%s')", catalogName)); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: flush failed: %v\n", err)
 			}
-			checkpointInfo = fmt.Sprintf("%.2fs", time.Since(ck0).Seconds())
+			flushInfo = fmt.Sprintf("%.2fs", time.Since(f0).Seconds())
 		}
 
 		s := getStorageStats(db, catalogName, table)
 		printStats(batchNum, numBatches, batchSize, batchSecs,
-			cumulative, elapsedTotal, s, checkpointInfo)
+			cumulative, elapsedTotal, s, flushInfo)
 	}
 
 	elapsedTotal := time.Since(startTotal).Seconds()
@@ -768,16 +768,16 @@ Modes:
 					fmt.Printf("  Batches      : %s%d%s\n", green, numBatches, reset)
 				}
 				if checkpointInterval == 0 {
-					fmt.Printf("  CHECKPOINT   : every %snever%s batches\n", green, reset)
+					fmt.Printf("  Flush        : %sdisabled%s\n", green, reset)
 				} else {
-					fmt.Printf("  CHECKPOINT   : every %s%d%s batches\n", green, checkpointInterval, reset)
+					fmt.Printf("  Flush        : every %s%d%s batches\n", green, checkpointInterval, reset)
 				}
 			} else if runMode == "ticker" {
 				fmt.Printf("  Duration     : %s%d%s seconds\n", green, duration, reset)
 				if checkpointInterval == 0 {
-					fmt.Printf("  CHECKPOINT   : disabled (no flush at end)\n")
+					fmt.Printf("  Flush        : %sdisabled%s (no flush at end)\n", green, reset)
 				} else {
-					fmt.Printf("  CHECKPOINT   : at end if inlined rows > %s%d%s\n", green, checkpointInterval, reset)
+					fmt.Printf("  Flush        : at end if inlined rows > %s%d%s\n", green, checkpointInterval, reset)
 				}
 			}
 			fmt.Println()
@@ -814,7 +814,7 @@ Modes:
 	runCmd.Flags().StringVarP(&runMode, "run-mode", "r", "batch", "Run mode: batch or ticker")
 	runCmd.Flags().IntVarP(&batchSize, "batch-size", "b", 100_000, "Rows to insert per batch (batch mode only)")
 	runCmd.Flags().IntVarP(&numBatches, "num-batches", "n", 10, "Number of batches (batch mode only, 0 = forever)")
-	runCmd.Flags().IntVarP(&checkpointInterval, "checkpoint-interval", "k", 10, "CHECKPOINT at end if inlined rows > N (batch/ticker mode, 0 = never)")
+	runCmd.Flags().IntVarP(&checkpointInterval, "flush-interval", "k", 10, "Flush inlined rows to Parquet every N batches, or at end if inlined rows > N (0 = never)")
 	runCmd.Flags().IntVarP(&duration, "duration", "d", 60, "Duration in seconds (ticker mode only)")
 
 	// ── Root command setup ──────────────────────────────────────────────────

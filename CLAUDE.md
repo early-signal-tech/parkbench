@@ -84,7 +84,7 @@ Inserts rows continuously and prints throughput stats.
 | `--table`, `-t` | _(auto)_ | Table name (defaults to `events` or `events_rich`) |
 | `--batch-size`, `-b` | `100000` | Rows per batch (batch mode only) |
 | `--num-batches`, `-n` | `10` | Number of batches; `0` = run forever |
-| `--checkpoint-interval`, `-k` | `10` | Flush inlined rows to Parquet if count > N (0 = never) |
+| `--flush-interval`, `-k` | `10` | Flush inlined rows to Parquet every N batches (batch mode) or at end if inlined rows > N (ticker mode); `0` = never |
 | `--duration`, `-d` | `60` | Duration in seconds (ticker mode only) |
 
 ## Schema Modes
@@ -101,9 +101,9 @@ id INTEGER, user_id VARCHAR, event_type VARCHAR, ts TIMESTAMP, payload JSON, met
 
 ## Run Modes
 
-**batch** — inserts `--batch-size` rows per iteration using a single `INSERT INTO ... SELECT range(N)` SQL statement. Fast bulk ingest.
+**batch** — inserts `--batch-size` rows per iteration using a single `INSERT INTO ... SELECT range(N)` SQL statement. Fast bulk ingest. Calls `ducklake_flush_inlined_data()` every `--flush-interval` batches to materialize inlined rows into Parquet files.
 
-**ticker** — inserts one row per second via `time.NewTicker`. Simulates a low-volume real-time stream. At the end, if inlined row count exceeds `--checkpoint-interval`, calls `ducklake_flush_inlined_data()` to write Parquet files.
+**ticker** — inserts one row per second via `time.NewTicker`. Simulates a low-volume real-time stream. At the end, if the number of new inlined rows exceeds `--flush-interval`, calls `ducklake_flush_inlined_data()` to write Parquet files.
 
 ## DuckLake Inlining Behavior
 
