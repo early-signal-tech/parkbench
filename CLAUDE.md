@@ -68,6 +68,15 @@ Inserts rows continuously and prints throughput stats.
 # ticker mode (1 row/sec for 60s)
 ./parkbench run --run-mode ticker --duration 60
 
+# ticker mode with 15% duplicate injection
+./parkbench run --run-mode ticker --duration 60 --duplicate-rate 0.15
+
+# ticker mode with 20% schema drift (inserts with unknown column are rejected)
+./parkbench run --run-mode ticker --duration 60 --schema-drift-rate 0.20
+
+# ticker mode with both duplicate and schema-drift anomalies
+./parkbench run --run-mode ticker --duration 60 --duplicate-rate 0.10 --schema-drift-rate 0.15
+
 # run forever
 ./parkbench run --num-batches 0
 ```
@@ -86,6 +95,8 @@ Inserts rows continuously and prints throughput stats.
 | `--num-batches`, `-n` | `10` | Number of batches; `0` = run forever |
 | `--flush-interval`, `-k` | `10` | Flush inlined rows to Parquet every N batches (batch mode) or at end if inlined rows > N (ticker mode); `0` = never |
 | `--duration`, `-d` | `60` | Duration in seconds (ticker mode only) |
+| `--duplicate-rate` | `0.0` | Probability (0.0–1.0) of injecting a duplicate row on each tick (ticker mode only); e.g. `0.15` = ~15% duplicates |
+| `--schema-drift-rate` | `0.0` | Probability (0.0–1.0) of injecting a schema-breaking row on each tick (ticker mode only); the insert targets an unknown column (`event_category` for simple, `schema_version` for rich) that doesn't exist in the table, causing DuckDB to reject it — simulating a source schema change that breaks downstream data capture |
 
 ## Schema Modes
 
