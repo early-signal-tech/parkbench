@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -154,6 +155,60 @@ func batchSQLRich(fqt string, startID, batchSize int) string {
 
 // ── Single-row SQL generation (for ticker mode) ────────────────────────────
 
+// tickerSQLSimpleDrifted inserts a row with a new column (event_category) that
+// does not exist in the table, simulating a source schema change that breaks
+// downstream data capture with an "unknown column" error.
+func tickerSQLSimpleDrifted(fqt string, id int) string {
+	return fmt.Sprintf(`
+		INSERT INTO %s (id, ts, event_type, event_category)
+		VALUES (
+			%d,
+			now(),
+			%s,
+			'engagement'
+		)`,
+		fqt, id,
+		"'"+eventTypes[id%len(eventTypes)]+"'",
+	)
+}
+
+// tickerSQLRichDrifted inserts a row with a new column (schema_version) that
+// does not exist in the table, simulating a source schema change.
+func tickerSQLRichDrifted(fqt string, id int) string {
+	return fmt.Sprintf(`
+		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata, schema_version)
+		VALUES (
+			%d,
+			'user_' || (%d)::VARCHAR,
+			%s,
+			now(),
+			{
+				'page':        %s,
+				'duration_ms': %d,
+				'value':       %.2f
+			}::VARIANT,
+			{
+				'source':      %s,
+				'country':     %s,
+				'session_id':  'sess_' || (%d)::VARCHAR,
+				'ab_variant':  '%s'
+			}::VARIANT,
+			2
+		)`,
+		fqt,
+		id,
+		1+id%99999,
+		"'"+eventTypes[id%len(eventTypes)]+"'",
+		"'"+pages[id%len(pages)]+"'",
+		100+id%9900,
+		float64(id)*0.01+0.01,
+		"'"+sources[id%len(sources)]+"'",
+		"'"+countries[id%len(countries)]+"'",
+		1+id%999999,
+		map[int]string{0: "A", 1: "B"}[id%2],
+	)
+}
+
 func tickerSQLSimple(fqt string, id int) string {
 	return fmt.Sprintf(`
 		INSERT INTO %s
@@ -222,6 +277,7 @@ const (
 	cyan   = "\033[36m"
 	green  = "\033[32m"
 	yellow = "\033[33m"
+	red    = "\033[31m"
 	bold   = "\033[1m"
 	dim    = "\033[2m"
 	reset  = "\033[0m"
@@ -307,6 +363,8 @@ func printTickerStats(
 	cumulative int64,
 	elapsedTotal float64,
 	s storageStats,
+	dupCount int64,
+	driftCount int64,
 ) {
 	overall := 0.0
 	if elapsedTotal > 0 {
@@ -327,6 +385,17 @@ func printTickerStats(
 	row("Tick number", commas(int64(tickNum)))
 	row("Total rows (COUNT)", commas(s.total))
 	row("Overall throughput", fmt.Sprintf("%s rows/sec", commas(int64(overall))))
+	if dupCount > 0 {
+		row("Duplicate rows injected", commas(dupCount))
+	}
+	if driftCount > 0 {
+		fmt.Printf("%s│%s %-30s %s%20s %s│%s\n",
+			cyan+bold, reset,
+			dim+red+"Schema drift errors"+reset,
+			red+bold, commas(driftCount), reset,
+			cyan+bold,
+		)
+	}
 
 	fmt.Printf("%s╰────────────────────────────────────────────────────╯%s\n", cyan+bold, reset)
 }
@@ -555,6 +624,8 @@ func runTickerMode(
 	schemaMode string,
 	duration int,
 	checkpointInterval int,
+	duplicateRate float64,
+	schemaDriftRate float64,
 	sigCh chan os.Signal,
 ) error {
 	fqt := catalogName + "." + table
@@ -572,8 +643,15 @@ func runTickerMode(
 		sqlGen = tickerSQLRich
 	}
 
+	driftSQLGen := tickerSQLSimpleDrifted
+	if schemaMode == "rich" {
+		driftSQLGen = tickerSQLRichDrifted
+	}
+
 	var (
 		cumulative int64
+		dupCount   int64
+		driftCount int64
 		startTotal = time.Now()
 		tickNum    int
 	)
@@ -600,12 +678,34 @@ loop:
 			if _, err := db.Exec(query); err != nil {
 				return fmt.Errorf("tick %d insert: %w", tickNum, err)
 			}
-
 			cumulative++
+
+			// Inject a duplicate row with probability duplicateRate.
+			if duplicateRate > 0 && rand.Float64() < duplicateRate {
+				if _, err := db.Exec(query); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: duplicate inject failed at tick %d: %v\n", tickNum, err)
+				} else {
+					dupCount++
+					cumulative++
+				}
+			}
+
+			// Inject a schema-drift row with probability schemaDriftRate.
+			// The drifted SQL targets a column that doesn't exist in the table,
+			// so DuckDB rejects it — simulating a downstream data-capture break
+			// when the source system emits a new field the pipeline doesn't know about.
+			if schemaDriftRate > 0 && rand.Float64() < schemaDriftRate {
+				driftSQL := driftSQLGen(fqt, id)
+				if _, err := db.Exec(driftSQL); err != nil {
+					driftCount++
+					fmt.Printf("\n%s⚠  Schema drift at tick %d:%s %v\n", red+bold, tickNum, reset, err)
+				}
+			}
+
 			elapsedTotal := time.Since(startTotal).Seconds()
 
 			s := getStorageStats(db, catalogName, table)
-			printTickerStats(tickNum, 1.0, cumulative, elapsedTotal, s)
+			printTickerStats(tickNum, 1.0, cumulative, elapsedTotal, s, dupCount, driftCount)
 		}
 	}
 
@@ -655,6 +755,14 @@ loop:
 		elapsedTotal,
 		commas(int64(overall)),
 	)
+	if dupCount > 0 {
+		fmt.Printf("%s  ↳ %s duplicate rows injected (duplicate rate %.0f%%)%s\n",
+			yellow, commas(dupCount), duplicateRate*100, reset)
+	}
+	if driftCount > 0 {
+		fmt.Printf("%s  ↳ %s schema drift errors (drift rate %.0f%%) — inserts rejected due to unknown column%s\n",
+			red, commas(driftCount), schemaDriftRate*100, reset)
+	}
 	return nil
 }
 
@@ -670,6 +778,8 @@ func main() {
 		numBatches         int
 		checkpointInterval int
 		duration           int
+		duplicateRate       float64
+		schemaDriftRate    float64
 	)
 
 	rootCmd := &cobra.Command{
@@ -750,6 +860,12 @@ Modes:
 			if runMode != "batch" && runMode != "ticker" {
 				return fmt.Errorf("--run-mode must be 'batch' or 'ticker', got %q", runMode)
 			}
+			if duplicateRate < 0 || duplicateRate > 1 {
+				return fmt.Errorf("--duplicate-rate must be between 0.0 and 1.0, got %.2f", duplicateRate)
+			}
+			if schemaDriftRate < 0 || schemaDriftRate > 1 {
+				return fmt.Errorf("--schema-drift-rate must be between 0.0 and 1.0, got %.2f", schemaDriftRate)
+			}
 
 			// ── banner ──────────────────────────────────────────────────────
 			rule("DuckLake Stream Benchmark")
@@ -779,6 +895,16 @@ Modes:
 				} else {
 					fmt.Printf("  Flush        : at end if inlined rows > %s%d%s\n", green, checkpointInterval, reset)
 				}
+				if duplicateRate > 0 {
+					fmt.Printf("  Duplicate rate : %s%.0f%%%s duplicate rows\n", yellow, duplicateRate*100, reset)
+				} else {
+					fmt.Printf("  Duplicate rate : %sdisabled%s\n", green, reset)
+				}
+				if schemaDriftRate > 0 {
+					fmt.Printf("  Schema drift : %s%.0f%%%s of ticks emit unknown column (insert will fail)\n", red, schemaDriftRate*100, reset)
+				} else {
+					fmt.Printf("  Schema drift : %sdisabled%s\n", green, reset)
+				}
 			}
 			fmt.Println()
 
@@ -800,7 +926,7 @@ Modes:
 
 			// ── run selected mode ───────────────────────────────────────────
 			if runMode == "ticker" {
-				return runTickerMode(db, catalogName, table, schemaMode, duration, checkpointInterval, sigCh)
+				return runTickerMode(db, catalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, sigCh)
 			}
 			return runBatchMode(db, catalogName, table, schemaMode, batchSize, numBatches, checkpointInterval, sigCh)
 		},
@@ -816,6 +942,8 @@ Modes:
 	runCmd.Flags().IntVarP(&numBatches, "num-batches", "n", 10, "Number of batches (batch mode only, 0 = forever)")
 	runCmd.Flags().IntVarP(&checkpointInterval, "flush-interval", "k", 10, "Flush inlined rows to Parquet every N batches, or at end if inlined rows > N (0 = never)")
 	runCmd.Flags().IntVarP(&duration, "duration", "d", 60, "Duration in seconds (ticker mode only)")
+	runCmd.Flags().Float64Var(&duplicateRate, "duplicate-rate", 0.0, "Probability (0.0–1.0) of injecting a duplicate row each tick (ticker mode only)")
+	runCmd.Flags().Float64Var(&schemaDriftRate, "schema-drift-rate", 0.0, "Probability (0.0–1.0) of injecting a schema-breaking row each tick (ticker mode only); the insert targets an unknown column and is rejected, simulating a source schema change")
 
 	// ── Root command setup ──────────────────────────────────────────────────
 
