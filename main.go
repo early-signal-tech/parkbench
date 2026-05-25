@@ -6,7 +6,7 @@
 // Schema Modes:
 //
 //	simple — {id, ts, event_type}
-//	rich   — {id, user_id, event_type, ts, payload VARIANT, metadata VARIANT}
+//	rich   — {id, user_id, event_type, ts, payload JSON, metadata JSON}
 //
 // Run Modes:
 //
@@ -136,13 +136,13 @@ func batchSQLRich(fqt string, startID, batchSize int) string {
 				'page':        (%s)[1 + (random() * %d)::INT],
 				'duration_ms': (100 + (random() * 9900)::INT),
 				'value':       round(random() * 499.99 + 0.01, 2)
-			}::VARIANT                                                           AS payload,
+			}::JSON                                                           AS payload,
 			{
 				'source':      (%s)[1 + (random() * %d)::INT],
 				'country':     (%s)[1 + (random() * %d)::INT],
 				'session_id':  'sess_' || (1 + (random() * 999999)::BIGINT)::VARCHAR,
 				'ab_variant':  CASE WHEN random() > 0.5 THEN 'A' ELSE 'B' END
-			}::VARIANT                                                           AS metadata
+			}::JSON                                                           AS metadata
 		FROM range(%d)`,
 		fqt, startID,
 		sqlArray(eventTypes), len(eventTypes)-1,
@@ -186,13 +186,13 @@ func tickerSQLRichDrifted(fqt string, id int) string {
 				'page':        %s,
 				'duration_ms': %d,
 				'value':       %.2f
-			}::VARIANT,
+			}::JSON,
 			{
 				'source':      %s,
 				'country':     %s,
 				'session_id':  'sess_' || (%d)::VARCHAR,
 				'ab_variant':  '%s'
-			}::VARIANT,
+			}::JSON,
 			2
 		)`,
 		fqt,
@@ -234,13 +234,13 @@ func tickerSQLRich(fqt string, id int) string {
 				'page':        %s,
 				'duration_ms': %d,
 				'value':       %.2f
-			}::VARIANT,
+			}::JSON,
 			{
 				'source':      %s,
 				'country':     %s,
 				'session_id':  'sess_' || (%d)::VARCHAR,
 				'ab_variant':  '%s'
-			}::VARIANT
+			}::JSON
 		)`,
 		fqt,
 		id,
@@ -413,8 +413,8 @@ const richDDL = `CREATE TABLE IF NOT EXISTS %s (
 	user_id     VARCHAR,
 	event_type  VARCHAR,
 	ts          TIMESTAMP,
-	payload     VARIANT,
-	metadata    VARIANT
+	payload     JSON,
+	metadata    JSON
 )`
 
 // ── run loops ──────────────────────────────────────────────────────────────
@@ -840,7 +840,7 @@ and re-runs setup to create fresh tables. Prompts for confirmation unless --forc
 Modes:
   Schema modes (simple, rich):
     simple  — {id, ts, event_type}
-    rich    — {id, user_id, event_type, ts, payload VARIANT, metadata VARIANT}
+    rich    — {id, user_id, event_type, ts, payload JSON, metadata JSON}
 
   Run modes (batch, ticker):
     batch   — Inserts large batches of rows (default)
