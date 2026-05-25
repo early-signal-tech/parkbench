@@ -32,6 +32,16 @@ CREATE TABLE wh.events_rich (
     metadata    JSON
 );
 
+-- Dead-letter table for rejected events (schema drift, etc.)
+CREATE TABLE wh.events_rejected (
+    rejected_at     TIMESTAMP,
+    source_table    VARCHAR,
+    anomaly_type    VARCHAR,
+    attempted_id    INTEGER,
+    error_message   VARCHAR,
+    payload         JSON
+);
+
 -- Verify tables were created
 SHOW TABLES FROM wh;
 
