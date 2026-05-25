@@ -96,7 +96,7 @@ Inserts rows continuously and prints throughput stats.
 | `--flush-interval`, `-k` | `10` | Flush inlined rows to Parquet every N batches (batch mode) or at end if inlined rows > N (ticker mode); `0` = never |
 | `--duration`, `-d` | `60` | Duration in seconds (ticker mode only) |
 | `--duplicate-rate` | `0.0` | Probability (0.0–1.0) of injecting a duplicate row on each tick (ticker mode only); e.g. `0.15` = ~15% duplicates |
-| `--schema-drift-rate` | `0.0` | Probability (0.0–1.0) of injecting a schema-breaking row on each tick (ticker mode only); the insert targets an unknown column (`event_category` for simple, `schema_version` for rich) that doesn't exist in the table, causing DuckDB to reject it — simulating a source schema change that breaks downstream data capture |
+| `--schema-drift-rate` | `0.0` | Probability (0.0–1.0) of injecting a schema-breaking row on each tick (ticker mode only); the insert targets an unknown column (`event_category` for simple, `schema_version` for rich) that doesn't exist in the table, causing DuckDB to reject it — the rejected event is dead-lettered to `wh.events_rejected` |
 
 ## Schema Modes
 
@@ -108,6 +108,22 @@ id INTEGER, ts TIMESTAMP, event_type VARCHAR
 **rich** — `wh.events_rich`
 ```sql
 id INTEGER, user_id VARCHAR, event_type VARCHAR, ts TIMESTAMP, payload JSON, metadata JSON
+```
+
+**rejected (dead letter)** — `wh.events_rejected`
+
+Schema-drift inserts that fail against the main table are recorded here so monitoring agents can detect pipeline issues:
+
+```sql
+rejected_at TIMESTAMP, source_table VARCHAR, anomaly_type VARCHAR,
+attempted_id INTEGER, error_message VARCHAR, payload JSON
+```
+
+Example queries:
+
+```sql
+SELECT COUNT(*) FROM wh.events_rejected WHERE anomaly_type = 'schema_drift';
+SELECT * FROM wh.events_rejected ORDER BY rejected_at DESC LIMIT 10;
 ```
 
 ## Run Modes
@@ -151,6 +167,7 @@ ATTACH 'ducklake:postgres:dbname=ducklake_v1 host=localhost' AS wh
 
 SELECT COUNT(*) FROM wh.events;
 SELECT * FROM wh.events LIMIT 10;
+SELECT COUNT(*) FROM wh.events_rejected WHERE anomaly_type = 'schema_drift';
 SELECT * FROM ducklake_settings('wh');
 ```
 

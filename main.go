@@ -437,6 +437,91 @@ const richDDL = `CREATE TABLE IF NOT EXISTS %s (
 	metadata    JSON
 )`
 
+const rejectedEventsDDL = `CREATE TABLE IF NOT EXISTS %s (
+	rejected_at     TIMESTAMP,
+	source_table    VARCHAR,
+	anomaly_type    VARCHAR,
+	attempted_id    INTEGER,
+	error_message   VARCHAR,
+	payload         JSON
+)`
+
+const rejectedEventsTable = "events_rejected"
+
+func sqlStringLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func createRejectedEventsTable(db *sql.DB, catalogName string) error {
+	fqt := catalogName + "." + rejectedEventsTable
+	_, err := db.Exec(fmt.Sprintf(rejectedEventsDDL, fqt))
+	return err
+}
+
+func simpleDriftPayload(id int) map[string]any {
+	return map[string]any{
+		"id":             id,
+		"event_type":     eventTypes[id%len(eventTypes)],
+		"event_category": "engagement",
+	}
+}
+
+func richDriftPayload(id int, userID string) map[string]any {
+	return map[string]any{
+		"id":             id,
+		"user_id":        userID,
+		"event_type":     eventTypes[id%len(eventTypes)],
+		"schema_version": 2,
+		"payload": map[string]any{
+			"page":        pages[id%len(pages)],
+			"duration_ms": 100 + id%9900,
+			"value":       float64(id)*0.01 + 0.01,
+		},
+		"metadata": map[string]any{
+			"source":     sources[id%len(sources)],
+			"country":    countries[id%len(countries)],
+			"session_id": fmt.Sprintf("sess_%d", 1+id%999999),
+			"ab_variant": map[int]string{0: "A", 1: "B"}[id%2],
+		},
+	}
+}
+
+func recordRejectedEvent(
+	db *sql.DB,
+	catalogName string,
+	sourceTable string,
+	anomalyType string,
+	attemptedID int,
+	insertErr error,
+	payload map[string]any,
+) error {
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	fqt := catalogName + "." + rejectedEventsTable
+	query := fmt.Sprintf(`
+		INSERT INTO %s (rejected_at, source_table, anomaly_type, attempted_id, error_message, payload)
+		VALUES (
+			now(),
+			%s,
+			%s,
+			%d,
+			%s,
+			%s::JSON
+		)`,
+		fqt,
+		sqlStringLiteral(sourceTable),
+		sqlStringLiteral(anomalyType),
+		attemptedID,
+		sqlStringLiteral(insertErr.Error()),
+		sqlStringLiteral(string(payloadJSON)),
+	)
+	_, err = db.Exec(query)
+	return err
+}
+
 // ── run loops ──────────────────────────────────────────────────────────────
 
 func buildAttachSQL(pgDSN, catalogName, dataPath string) string {
@@ -471,11 +556,16 @@ func runSetup(pgDSN, catalogName, dataPath string) error {
 		return fmt.Errorf("create rich table: %w", err)
 	}
 
+	if err := createRejectedEventsTable(db, catalogName); err != nil {
+		return fmt.Errorf("create rejected events table: %w", err)
+	}
+
 	rule("DuckLake Setup Complete")
 	fmt.Printf("  Postgres DSN : %s%s%s\n", green, pgDSN, reset)
 	fmt.Printf("  Data path    : %s%s%s\n", green, dataPath, reset)
 	fmt.Printf("  Catalog name : %s%s%s\n", green, catalogName, reset)
-	fmt.Printf("  Tables       : %s%s.events, %s.events_rich%s\n", green, catalogName, catalogName, reset)
+	fmt.Printf("  Tables       : %s%s.events, %s.events_rich, %s.%s%s\n",
+		green, catalogName, catalogName, catalogName, rejectedEventsTable, reset)
 	fmt.Println()
 	fmt.Printf("%s✓ Setup complete. Ready for benchmarking!%s\n", green, reset)
 	return nil
@@ -666,6 +756,9 @@ func runTickerMode(
 	if _, err := db.Exec(fmt.Sprintf(ddl, fqt)); err != nil {
 		return fmt.Errorf("create table: %w", err)
 	}
+	if err := createRejectedEventsTable(db, catalogName); err != nil {
+		return fmt.Errorf("create rejected events table: %w", err)
+	}
 
 	maxID, err := getMaxID(db, catalogName, table)
 	if err != nil {
@@ -708,13 +801,17 @@ loop:
 
 			var query string
 			var driftSQL string
+			var driftPayload map[string]any
+			var userID string
 			if schemaMode == "rich" {
-				userID := streamUsers[rand.Intn(len(streamUsers))]
+				userID = streamUsers[rand.Intn(len(streamUsers))]
 				query = tickerSQLRich(fqt, id, userID)
 				driftSQL = tickerSQLRichDrifted(fqt, id, userID)
+				driftPayload = richDriftPayload(id, userID)
 			} else {
 				query = tickerSQLSimple(fqt, id)
 				driftSQL = tickerSQLSimpleDrifted(fqt, id)
+				driftPayload = simpleDriftPayload(id)
 			}
 
 			if _, err := db.Exec(query); err != nil {
@@ -740,6 +837,9 @@ loop:
 				if _, err := db.Exec(driftSQL); err != nil {
 					driftCount++
 					fmt.Printf("\n%s⚠  Schema drift at tick %d:%s %v\n", red+bold, tickNum, reset, err)
+					if dlqErr := recordRejectedEvent(db, catalogName, table, "schema_drift", id, err, driftPayload); dlqErr != nil {
+						fmt.Fprintf(os.Stderr, "warning: failed to record rejected event at tick %d: %v\n", tickNum, dlqErr)
+					}
 				}
 			}
 
@@ -801,8 +901,8 @@ loop:
 			yellow, commas(dupCount), duplicateRate*100, reset)
 	}
 	if driftCount > 0 {
-		fmt.Printf("%s  ↳ %s schema drift errors (drift rate %.0f%%) — inserts rejected due to unknown column%s\n",
-			red, commas(driftCount), schemaDriftRate*100, reset)
+		fmt.Printf("%s  ↳ %s schema drift errors (drift rate %.0f%%) — recorded in %s.%s%s\n",
+			red, commas(driftCount), schemaDriftRate*100, catalogName, rejectedEventsTable, reset)
 	}
 	return nil
 }
