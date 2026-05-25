@@ -38,6 +38,13 @@ var (
 	pages      = []string{"/home", "/product", "/cart", "/checkout", "/profile", "/search", "/settings"}
 	sources    = []string{"web", "mobile", "api", "email", "push"}
 	countries  = []string{"US", "GB", "DE", "FR", "JP", "CA", "AU", "BR"}
+	streamUsers = func() []string {
+		users := make([]string, 20)
+		for i := range users {
+			users[i] = fmt.Sprintf("user_%d", i+1)
+		}
+		return users
+	}()
 )
 
 // ── flush state management ────────────────────────────────────────────────
@@ -129,7 +136,7 @@ func batchSQLRich(fqt string, startID, batchSize int) string {
 		INSERT INTO %s
 		SELECT
 			range + %d                                                           AS id,
-			'user_' || (1 + (random() * 99999)::BIGINT)::VARCHAR               AS user_id,
+			(%s)[1 + (random() * %d)::INT]                                      AS user_id,
 			(%s)[1 + (random() * %d)::INT]                                      AS event_type,
 			now() - INTERVAL (random() * 86400) SECOND                          AS ts,
 			{
@@ -145,6 +152,7 @@ func batchSQLRich(fqt string, startID, batchSize int) string {
 			}::JSON                                                           AS metadata
 		FROM range(%d)`,
 		fqt, startID,
+		sqlArray(streamUsers), len(streamUsers)-1,
 		sqlArray(eventTypes), len(eventTypes)-1,
 		sqlArray(pages), len(pages)-1,
 		sqlArray(sources), len(sources)-1,
@@ -174,12 +182,12 @@ func tickerSQLSimpleDrifted(fqt string, id int) string {
 
 // tickerSQLRichDrifted inserts a row with a new column (schema_version) that
 // does not exist in the table, simulating a source schema change.
-func tickerSQLRichDrifted(fqt string, id int) string {
+func tickerSQLRichDrifted(fqt string, id int, userID string) string {
 	return fmt.Sprintf(`
 		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata, schema_version)
 		VALUES (
 			%d,
-			'user_' || (%d)::VARCHAR,
+			'%s',
 			%s,
 			now(),
 			{
@@ -197,7 +205,7 @@ func tickerSQLRichDrifted(fqt string, id int) string {
 		)`,
 		fqt,
 		id,
-		1+id%99999,
+		userID,
 		"'"+eventTypes[id%len(eventTypes)]+"'",
 		"'"+pages[id%len(pages)]+"'",
 		100+id%9900,
@@ -222,12 +230,12 @@ func tickerSQLSimple(fqt string, id int) string {
 	)
 }
 
-func tickerSQLRich(fqt string, id int) string {
+func tickerSQLRich(fqt string, id int, userID string) string {
 	return fmt.Sprintf(`
 		INSERT INTO %s
 		VALUES (
 			%d,
-			'user_' || (%d)::VARCHAR,
+			'%s',
 			%s,
 			now(),
 			{
@@ -244,7 +252,7 @@ func tickerSQLRich(fqt string, id int) string {
 		)`,
 		fqt,
 		id,
-		1+id%99999,
+		userID,
 		"'"+eventTypes[id%len(eventTypes)]+"'",
 		"'"+pages[id%len(pages)]+"'",
 		100+id%9900,
@@ -269,6 +277,18 @@ func getStorageStats(db *sql.DB, catalog, table string) storageStats {
 	_ = row.Scan(&s.total)
 
 	return s
+}
+
+func getMaxID(db *sql.DB, catalog, table string) (int, error) {
+	var maxID sql.NullInt64
+	err := db.QueryRow(fmt.Sprintf("SELECT MAX(id) FROM %s.%s", catalog, table)).Scan(&maxID)
+	if err != nil {
+		return 0, err
+	}
+	if !maxID.Valid {
+		return -1, nil
+	}
+	return int(maxID.Int64), nil
 }
 
 // ── terminal output helpers ───────────────────────────────────────────────────
@@ -558,6 +578,14 @@ func runBatchMode(
 		sqlGen = batchSQLRich
 	}
 
+	maxID, err := getMaxID(db, catalogName, table)
+	if err != nil {
+		return fmt.Errorf("query max id: %w", err)
+	}
+	nextID := maxID + 1
+	fmt.Printf("  Starting ID   : %s%d%s (max existing: %s%d%s)\n",
+		green, nextID, reset, dim, maxID, reset)
+
 	var (
 		cumulative int64
 		startTotal = time.Now()
@@ -577,7 +605,8 @@ loop:
 		}
 
 		batchNum++
-		startID := int(cumulative)
+		startID := nextID
+		nextID += batchSize
 
 		query := sqlGen(fqt, startID, batchSize)
 		t0 := time.Now()
@@ -638,14 +667,16 @@ func runTickerMode(
 		return fmt.Errorf("create table: %w", err)
 	}
 
-	sqlGen := tickerSQLSimple
-	if schemaMode == "rich" {
-		sqlGen = tickerSQLRich
+	maxID, err := getMaxID(db, catalogName, table)
+	if err != nil {
+		return fmt.Errorf("query max id: %w", err)
 	}
-
-	driftSQLGen := tickerSQLSimpleDrifted
+	nextID := maxID + 1
+	fmt.Printf("  Starting ID   : %s%d%s (max existing: %s%d%s)\n",
+		green, nextID, reset, dim, maxID, reset)
 	if schemaMode == "rich" {
-		driftSQLGen = tickerSQLRichDrifted
+		fmt.Printf("  User pool     : %s%d%s users (%suser_1..user_%d%s), random per event\n",
+			green, len(streamUsers), reset, dim, len(streamUsers), reset)
 	}
 
 	var (
@@ -672,9 +703,20 @@ loop:
 			break loop
 		case <-ticker.C:
 			tickNum++
-			id := int(cumulative)
+			id := nextID
+			nextID++
 
-			query := sqlGen(fqt, id)
+			var query string
+			var driftSQL string
+			if schemaMode == "rich" {
+				userID := streamUsers[rand.Intn(len(streamUsers))]
+				query = tickerSQLRich(fqt, id, userID)
+				driftSQL = tickerSQLRichDrifted(fqt, id, userID)
+			} else {
+				query = tickerSQLSimple(fqt, id)
+				driftSQL = tickerSQLSimpleDrifted(fqt, id)
+			}
+
 			if _, err := db.Exec(query); err != nil {
 				return fmt.Errorf("tick %d insert: %w", tickNum, err)
 			}
@@ -695,7 +737,6 @@ loop:
 			// so DuckDB rejects it — simulating a downstream data-capture break
 			// when the source system emits a new field the pipeline doesn't know about.
 			if schemaDriftRate > 0 && rand.Float64() < schemaDriftRate {
-				driftSQL := driftSQLGen(fqt, id)
 				if _, err := db.Exec(driftSQL); err != nil {
 					driftCount++
 					fmt.Printf("\n%s⚠  Schema drift at tick %d:%s %v\n", red+bold, tickNum, reset, err)
