@@ -1,0 +1,238 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 420" width="860" height="420" style="font-family: 'JetBrains Mono', 'Fira Code', monospace; background: #0d1117;">
+
+  <defs>
+    <filter id="glow-green" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow-blue" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow-yellow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#000" flood-opacity="0.5"/>
+    </filter>
+
+    <linearGradient id="grad-green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a4a2e"/>
+      <stop offset="100%" style="stop-color:#0d2818"/>
+    </linearGradient>
+    <linearGradient id="grad-blue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a2a4a"/>
+      <stop offset="100%" style="stop-color:#0d1828"/>
+    </linearGradient>
+    <linearGradient id="grad-yellow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3a2e0d"/>
+      <stop offset="100%" style="stop-color:#201a08"/>
+    </linearGradient>
+    <linearGradient id="grad-purple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#2a1a4a"/>
+      <stop offset="100%" style="stop-color:#180d28"/>
+    </linearGradient>
+
+    <marker id="arr-red" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#ff453a"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="860" height="420" fill="#0d1117" rx="12"/>
+
+  <!-- Subtle grid -->
+  <g stroke="#1c2128" stroke-width="0.5" opacity="0.6">
+    <line x1="0" y1="60" x2="860" y2="60"/>
+    <line x1="0" y1="360" x2="860" y2="360"/>
+    <line x1="200" y1="60" x2="200" y2="360"/>
+    <line x1="430" y1="60" x2="430" y2="360"/>
+    <line x1="660" y1="60" x2="660" y2="360"/>
+  </g>
+
+  <!-- Title bar -->
+  <rect x="0" y="0" width="860" height="50" fill="#161b22" rx="12"/>
+  <rect x="0" y="38" width="860" height="12" fill="#161b22"/>
+  <circle cx="24" cy="25" r="6" fill="#ff5f57"/>
+  <circle cx="44" cy="25" r="6" fill="#febc2e"/>
+  <circle cx="64" cy="25" r="6" fill="#28c840"/>
+  <text x="430" y="31" text-anchor="middle" fill="#e6edf3" font-size="15" font-weight="700" letter-spacing="2">parkbench -- DuckLake Streaming Benchmark</text>
+
+  <!-- ===================== BOX 1: CLI / DATA GENERATOR ===================== -->
+  <rect x="20" y="70" width="180" height="270" rx="10" fill="url(#grad-green)" stroke="#30d158" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="110" y="95" text-anchor="middle" fill="#30d158" font-size="12" font-weight="700" letter-spacing="1" filter="url(#glow-green)">GO CLI</text>
+
+  <!-- Terminal icon (unicode keyboard) -->
+  <text x="110" y="122" text-anchor="middle" font-size="22" fill="#30d158">&#x2328;</text>
+
+  <!-- Command block -->
+  <rect x="30" y="133" width="160" height="70" rx="4" fill="#0d1117" stroke="#30d158" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="40" y="150" fill="#30d158" font-size="9.5">$ parkbench run \</text>
+  <text x="40" y="164" fill="#30d158" font-size="9.5">  --mode rich \</text>
+  <text x="40" y="178" fill="#30d158" font-size="9.5">  --run-mode ticker \</text>
+  <text x="40" y="192" fill="#30d158" font-size="9.5">  --duration 60</text>
+
+  <!-- Blinking cursor -->
+  <rect x="40" y="196" width="7" height="10" fill="#30d158">
+    <animate attributeName="opacity" values="1;0;1" dur="1s" repeatCount="indefinite"/>
+  </rect>
+
+  <text x="110" y="225" text-anchor="middle" fill="#8b949e" font-size="10">Generates rows</text>
+  <text x="110" y="242" text-anchor="middle" fill="#8b949e" font-size="10">1 row/sec (ticker)</text>
+  <text x="110" y="258" text-anchor="middle" fill="#8b949e" font-size="10">or 100k/batch</text>
+
+  <!-- Scrolling row output -->
+  <g font-size="8.5" fill="#30d158" opacity="0.8">
+    <text x="35" y="284">id=1042 ts=2026-05-28...</text>
+    <text x="35" y="296">id=1043 ts=2026-05-28...</text>
+    <text x="35" y="308">id=1044 ts=2026-05-28...</text>
+    <text x="35" y="320">id=1045 ts=2026-05-28...</text>
+    <text x="35" y="332" opacity="0">id=1046 ts=2026-05-28...
+      <animate attributeName="opacity" values="0;1;1;0" dur="2s" begin="0s" repeatCount="indefinite"/>
+    </text>
+  </g>
+
+  <!-- ===================== PIPE 1: CLI -> DuckDB ===================== -->
+  <line x1="200" y1="210" x2="310" y2="210" stroke="#30d158" stroke-width="2" stroke-opacity="0.3" stroke-dasharray="6 4"/>
+  <text x="255" y="204" text-anchor="middle" fill="#30d158" font-size="9" opacity="0.9">INSERT INTO</text>
+
+  <circle r="6" fill="#30d158" filter="url(#glow-green)">
+    <animateMotion path="M200,210 L310,210" dur="1.2s" begin="0s" repeatCount="indefinite"/>
+  </circle>
+  <circle r="6" fill="#30d158" filter="url(#glow-green)">
+    <animateMotion path="M200,210 L310,210" dur="1.2s" begin="0.4s" repeatCount="indefinite"/>
+  </circle>
+  <circle r="6" fill="#30d158" filter="url(#glow-green)">
+    <animateMotion path="M200,210 L310,210" dur="1.2s" begin="0.8s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- ===================== BOX 2: DuckDB + DuckLake ===================== -->
+  <rect x="310" y="70" width="200" height="270" rx="10" fill="url(#grad-blue)" stroke="#58a6ff" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="410" y="93" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="700" letter-spacing="1" filter="url(#glow-blue)">DuckDB + DuckLake</text>
+
+  <!-- Duck emoji -->
+  <text x="410" y="126" text-anchor="middle" font-size="26" fill="#58a6ff">&#x1F986;</text>
+
+  <!-- Extension badge -->
+  <rect x="355" y="138" width="110" height="20" rx="4" fill="#1a2a4a" stroke="#58a6ff" stroke-width="0.8"/>
+  <text x="410" y="152" text-anchor="middle" fill="#58a6ff" font-size="9.5">LOAD ducklake;</text>
+
+  <!-- ATTACH block -->
+  <rect x="320" y="166" width="180" height="72" rx="4" fill="#0d1117" stroke="#58a6ff" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="330" y="181" fill="#58a6ff" font-size="8.5">ATTACH</text>
+  <text x="330" y="193" fill="#e6edf3" font-size="8">'ducklake:postgres:...</text>
+  <text x="330" y="205" fill="#e6edf3" font-size="8">  dbname=ducklake_v1'</text>
+  <text x="330" y="217" fill="#e6edf3" font-size="8">AS wh (DATA_PATH</text>
+  <text x="330" y="229" fill="#e6edf3" font-size="8">  './ducklake_data')</text>
+
+  <!-- Inline buffer indicator -->
+  <text x="410" y="258" text-anchor="middle" fill="#8b949e" font-size="10">Inlined rows buffer</text>
+  <rect x="330" y="263" width="160" height="14" rx="3" fill="#0d1117" stroke="#58a6ff" stroke-width="0.6"/>
+  <rect x="331" y="264" width="0" height="12" rx="3" fill="#58a6ff" opacity="0.7">
+    <animate attributeName="width" values="0;140;160;0" dur="4s" repeatCount="indefinite"/>
+  </rect>
+
+  <text x="410" y="298" text-anchor="middle" fill="#8b949e" font-size="9">ducklake_flush_inlined_data()</text>
+  <text x="410" y="316" text-anchor="middle" fill="#58a6ff" font-size="10">
+    flush every N batches
+    <animate attributeName="opacity" values="1;0.3;1" dur="2.5s" repeatCount="indefinite"/>
+  </text>
+
+  <!-- ===================== PIPE 2: DuckDB -> Postgres (metadata) ===================== -->
+  <path d="M510,160 Q565,160 570,155 L640,155" fill="none" stroke="#ffd60a" stroke-width="2" stroke-opacity="0.3" stroke-dasharray="5 4"/>
+  <text x="575" y="148" text-anchor="middle" fill="#ffd60a" font-size="9" opacity="0.9">metadata</text>
+
+  <circle r="5" fill="#ffd60a" filter="url(#glow-yellow)">
+    <animateMotion path="M510,160 Q565,160 570,155 L640,155" dur="1.5s" begin="0.2s" repeatCount="indefinite"/>
+  </circle>
+  <circle r="5" fill="#ffd60a" filter="url(#glow-yellow)">
+    <animateMotion path="M510,160 Q565,160 570,155 L640,155" dur="1.5s" begin="0.9s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- ===================== PIPE 3: DuckDB -> Parquet (data) ===================== -->
+  <path d="M510,260 Q565,260 570,265 L640,265" fill="none" stroke="#bf5af2" stroke-width="2" stroke-opacity="0.3" stroke-dasharray="5 4"/>
+  <text x="575" y="282" text-anchor="middle" fill="#bf5af2" font-size="9" opacity="0.9">data rows</text>
+
+  <circle r="5" fill="#bf5af2" filter="url(#glow-blue)">
+    <animateMotion path="M510,260 Q565,260 570,265 L640,265" dur="1.8s" begin="0.5s" repeatCount="indefinite"/>
+  </circle>
+  <circle r="5" fill="#bf5af2" filter="url(#glow-blue)">
+    <animateMotion path="M510,260 Q565,260 570,265 L640,265" dur="1.8s" begin="1.1s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- ===================== BOX 3a: PostgreSQL ===================== -->
+  <rect x="640" y="70" width="200" height="148" rx="10" fill="url(#grad-yellow)" stroke="#ffd60a" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="740" y="93" text-anchor="middle" fill="#ffd60a" font-size="12" font-weight="700" letter-spacing="1" filter="url(#glow-yellow)">PostgreSQL</text>
+  <text x="740" y="108" text-anchor="middle" fill="#ffd60a" font-size="10" opacity="0.8">Metadata Store</text>
+
+  <!-- Elephant emoji -->
+  <text x="740" y="130" text-anchor="middle" font-size="22" fill="#ffd60a">&#x1F418;</text>
+
+  <rect x="675" y="136" width="130" height="18" rx="3" fill="#0d1117" stroke="#ffd60a" stroke-width="0.6"/>
+  <text x="740" y="148" text-anchor="middle" fill="#ffd60a" font-size="9">ducklake_v1 database</text>
+
+  <text x="655" y="168" fill="#8b949e" font-size="9">Tables (DuckLake system):</text>
+  <text x="655" y="181" fill="#ffd60a" font-size="8.5">  ducklake_file_snapshots</text>
+  <text x="655" y="193" fill="#ffd60a" font-size="8.5">  ducklake_columns, _tables...</text>
+
+  <!-- Pulse indicator -->
+  <circle cx="820" cy="82" r="4" fill="#ffd60a">
+    <animate attributeName="r" values="4;7;4" dur="1.5s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="1;0.3;1" dur="1.5s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- ===================== BOX 3b: Parquet Files ===================== -->
+  <rect x="640" y="228" width="200" height="112" rx="10" fill="url(#grad-purple)" stroke="#bf5af2" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="740" y="251" text-anchor="middle" fill="#bf5af2" font-size="12" font-weight="700" letter-spacing="1">Parquet Files</text>
+  <text x="740" y="266" text-anchor="middle" fill="#bf5af2" font-size="10" opacity="0.8">./ducklake_data/</text>
+
+  <g fill="#bf5af2" font-size="8.5">
+    <text x="652" y="285">&#x1F4C4; wh/events/snap_001.parquet</text>
+    <text x="652" y="298">&#x1F4C4; wh/events/snap_002.parquet</text>
+    <text x="652" y="311">&#x1F4C4; wh/events_rich/...</text>
+    <text x="652" y="324" opacity="0">&#x1F4C4; wh/events/snap_003.parquet
+      <animate attributeName="opacity" values="0;1;1;0.5" dur="3s" begin="1s" repeatCount="indefinite"/>
+    </text>
+  </g>
+
+  <!-- Pulse indicator -->
+  <circle cx="820" cy="240" r="4" fill="#bf5af2">
+    <animate attributeName="r" values="4;7;4" dur="2s" begin="0.5s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="1;0.3;1" dur="2s" begin="0.5s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- ===================== Anomaly badges ===================== -->
+  <rect x="22" y="346" width="82" height="14" rx="3" fill="#2d1a1a" stroke="#ff453a" stroke-width="0.8"/>
+  <text x="63" y="356" text-anchor="middle" fill="#ff453a" font-size="8.5">~15% duplicates</text>
+
+  <rect x="114" y="346" width="84" height="14" rx="3" fill="#2d1a2d" stroke="#bf5af2" stroke-width="0.8"/>
+  <text x="156" y="356" text-anchor="middle" fill="#bf5af2" font-size="8.5">~20% schema drift</text>
+
+  <!-- Dead-letter arrow -->
+  <path d="M410,340 L410,354" fill="none" stroke="#ff453a" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#arr-red)"/>
+  <rect x="345" y="341" width="130" height="16" rx="3" fill="#2d1a1a" stroke="#ff453a" stroke-width="0.8"/>
+  <text x="410" y="352" text-anchor="middle" fill="#ff453a" font-size="9">-&gt; wh.events_rejected</text>
+
+  <!-- ===================== Stats bar ===================== -->
+  <rect x="20" y="362" width="820" height="46" rx="8" fill="#161b22" stroke="#30303a" stroke-width="1"/>
+
+  <text x="50" y="380" fill="#8b949e" font-size="10">rows inserted</text>
+  <text x="50" y="398" fill="#30d158" font-size="13" font-weight="700" filter="url(#glow-green)">1,042,000</text>
+
+  <text x="210" y="380" fill="#8b949e" font-size="10">throughput</text>
+  <text x="210" y="398" fill="#58a6ff" font-size="13" font-weight="700">98,432 rows/s</text>
+
+  <text x="390" y="380" fill="#8b949e" font-size="10">schema modes</text>
+  <text x="390" y="398" fill="#ffd60a" font-size="11">simple / rich / rejected</text>
+
+  <text x="580" y="380" fill="#8b949e" font-size="10">run modes</text>
+  <text x="580" y="398" fill="#bf5af2" font-size="11">batch / ticker</text>
+
+  <circle cx="735" cy="383" r="5" fill="#30d158">
+    <animate attributeName="r" values="5;8;5" dur="1.2s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="1;0.4;1" dur="1.2s" repeatCount="indefinite"/>
+  </circle>
+  <text x="748" y="387" fill="#30d158" font-size="12" font-weight="700">RUNNING</text>
+
+</svg>

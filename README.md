@@ -2,6 +2,8 @@
 
 A high-performance CLI tool for benchmarking DuckLake catalog inserts with flexible path handling and multiple run modes.
 
+![Parkbench architecture diagram](parkbench-diagram.svg)
+
 ## Quick Install
 
 Download and run the installer script in one command:
