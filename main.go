@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -117,28 +118,55 @@ func sqlArray(ss []string) string {
 
 // ── SQL generation ────────────────────────────────────────────────────────────
 
-func batchSQLSimple(fqt string, startID, batchSize int) string {
+func batchSQLSimple(fqt string, startID, batchSize int, distribution string, hotspotDays int) string {
+	var tsExpr string
+	if distribution == "hotspot" {
+		// 70% in last 6 hours, 30% spread across past N days
+		oldestSeconds := hotspotDays * 24 * 3600
+		tsExpr = fmt.Sprintf(`CASE
+			WHEN random() < 0.7 THEN now() - INTERVAL (random() * 21600) SECOND
+			ELSE now() - INTERVAL (21600 + random() * %d) SECOND
+		END`, oldestSeconds-21600)
+	} else {
+		// default: uniform across past 24 hours
+		tsExpr = "now() - INTERVAL (random() * 86400) SECOND"
+	}
+
 	return fmt.Sprintf(`
 		INSERT INTO %s
 		SELECT
 			range + %d                                                    AS id,
-			now() - INTERVAL (random() * 86400) SECOND                   AS ts,
+			%s                                                            AS ts,
 			(%s)[1 + (random() * %d)::INT]                               AS event_type
 		FROM range(%d)`,
 		fqt, startID,
+		tsExpr,
 		sqlArray(eventTypes), len(eventTypes)-1,
 		batchSize,
 	)
 }
 
-func batchSQLRich(fqt string, startID, batchSize int) string {
+func batchSQLRich(fqt string, startID, batchSize int, distribution string, hotspotDays int) string {
+	var tsExpr string
+	if distribution == "hotspot" {
+		// 70% in last 6 hours, 30% spread across past N days
+		oldestSeconds := hotspotDays * 24 * 3600
+		tsExpr = fmt.Sprintf(`CASE
+			WHEN random() < 0.7 THEN now() - INTERVAL (random() * 21600) SECOND
+			ELSE now() - INTERVAL (21600 + random() * %d) SECOND
+		END`, oldestSeconds-21600)
+	} else {
+		// default: uniform across past 24 hours
+		tsExpr = "now() - INTERVAL (random() * 86400) SECOND"
+	}
+
 	return fmt.Sprintf(`
 		INSERT INTO %s
 		SELECT
 			range + %d                                                           AS id,
 			(%s)[1 + (random() * %d)::INT]                                      AS user_id,
 			(%s)[1 + (random() * %d)::INT]                                      AS event_type,
-			now() - INTERVAL (random() * 86400) SECOND                          AS ts,
+			%s                                                                   AS ts,
 			{
 				'page':        (%s)[1 + (random() * %d)::INT],
 				'duration_ms': (100 + (random() * 9900)::INT),
@@ -154,6 +182,7 @@ func batchSQLRich(fqt string, startID, batchSize int) string {
 		fqt, startID,
 		sqlArray(streamUsers), len(streamUsers)-1,
 		sqlArray(eventTypes), len(eventTypes)-1,
+		tsExpr,
 		sqlArray(pages), len(pages)-1,
 		sqlArray(sources), len(sources)-1,
 		sqlArray(countries), len(countries)-1,
@@ -524,9 +553,16 @@ func recordRejectedEvent(
 
 // ── run loops ──────────────────────────────────────────────────────────────
 
-func buildAttachSQL(pgDSN, catalogName, dataPath string) string {
+func buildAttachSQL(metadataStore, pgDSN, catalogName, dataPath string) string {
 	if dataPath == "" {
 		dataPath = "."
+	}
+	if metadataStore == "duckdb" {
+		catalogFile := filepath.Join(dataPath, catalogName+".ducklake")
+		return fmt.Sprintf(
+			"ATTACH 'ducklake:duckdb:%s' AS %s (DATA_PATH '%s', AUTOMATIC_MIGRATION TRUE)",
+			catalogFile, catalogName, dataPath,
+		)
 	}
 	return fmt.Sprintf(
 		"ATTACH 'ducklake:postgres:%s' AS %s (DATA_PATH '%s', AUTOMATIC_MIGRATION TRUE)",
@@ -534,14 +570,21 @@ func buildAttachSQL(pgDSN, catalogName, dataPath string) string {
 	)
 }
 
-func runSetup(pgDSN, catalogName, dataPath string) error {
+func runSetup(metadataStore, pgDSN, catalogName, dataPath string) error {
+	// For DuckDB mode, ensure data directory exists first
+	if metadataStore == "duckdb" {
+		if err := os.MkdirAll(dataPath, 0755); err != nil {
+			return fmt.Errorf("create data directory: %w", err)
+		}
+	}
+
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return fmt.Errorf("open duckdb: %w", err)
 	}
 	defer db.Close()
 
-	attachSQL := buildAttachSQL(pgDSN, catalogName, dataPath)
+	attachSQL := buildAttachSQL(metadataStore, pgDSN, catalogName, dataPath)
 	if _, err := db.Exec(attachSQL); err != nil {
 		return fmt.Errorf("attach catalog: %w", err)
 	}
@@ -561,7 +604,13 @@ func runSetup(pgDSN, catalogName, dataPath string) error {
 	}
 
 	rule("DuckLake Setup Complete")
-	fmt.Printf("  Postgres DSN : %s%s%s\n", green, pgDSN, reset)
+	if metadataStore == "duckdb" {
+		catalogFile := filepath.Join(dataPath, catalogName+".ducklake")
+		fmt.Printf("  Metadata store : %sDuckDB%s (%s%s%s)\n", green, reset, green, catalogFile, reset)
+	} else {
+		fmt.Printf("  Metadata store : %sPostgreSQL%s\n", green, reset)
+		fmt.Printf("  Postgres DSN   : %s%s%s\n", green, pgDSN, reset)
+	}
 	fmt.Printf("  Data path    : %s%s%s\n", green, dataPath, reset)
 	fmt.Printf("  Catalog name : %s%s%s\n", green, catalogName, reset)
 	fmt.Printf("  Tables       : %s%s.events, %s.events_rich, %s.%s%s\n",
@@ -571,25 +620,21 @@ func runSetup(pgDSN, catalogName, dataPath string) error {
 	return nil
 }
 
-func runReset(pgDSN, catalogName, dataPath string, force bool) error {
-	// Extract dbname from DSN for the DROP/CREATE commands.
-	// We connect to the "postgres" maintenance database to drop/create.
-	dbName := "ducklake_v1"
-	for _, part := range strings.Fields(pgDSN) {
-		if strings.HasPrefix(part, "dbname=") {
-			dbName = strings.TrimPrefix(part, "dbname=")
-		}
-	}
-
-	// Build a maintenance DSN (same host/port/user, but connect to "postgres").
-	maintDSN := strings.ReplaceAll(pgDSN, "dbname="+dbName, "dbname=postgres")
-	if !strings.Contains(maintDSN, "dbname=") {
-		maintDSN = "dbname=postgres " + pgDSN
-	}
-
+func runReset(metadataStore, pgDSN, catalogName, dataPath string, force bool) error {
 	if !force {
 		fmt.Printf("%s%sWARNING:%s This will permanently delete:\n", bold, yellow, reset)
-		fmt.Printf("  • Postgres database : %s%s%s\n", bold, dbName, reset)
+		if metadataStore == "duckdb" {
+			catalogFile := filepath.Join(dataPath, catalogName+".ducklake")
+			fmt.Printf("  • Catalog file      : %s%s%s\n", bold, catalogFile, reset)
+		} else {
+			dbName := "ducklake_v1"
+			for _, part := range strings.Fields(pgDSN) {
+				if strings.HasPrefix(part, "dbname=") {
+					dbName = strings.TrimPrefix(part, "dbname=")
+				}
+			}
+			fmt.Printf("  • Postgres database : %s%s%s\n", bold, dbName, reset)
+		}
 		fmt.Printf("  • Data directory    : %s%s%s\n", bold, dataPath, reset)
 		fmt.Printf("\nType %syes%s to continue: ", bold, reset)
 		scanner := bufio.NewScanner(os.Stdin)
@@ -602,25 +647,49 @@ func runReset(pgDSN, catalogName, dataPath string, force bool) error {
 
 	rule("DuckLake Reset")
 
-	// Drop the database.
-	fmt.Printf("  Dropping database  %s%s%s ...", bold, dbName, reset)
-	drop := exec.Command("psql", "-d", maintDSN, "-c", fmt.Sprintf("DROP DATABASE IF EXISTS %s;", dbName))
-	drop.Env = os.Environ()
-	if out, err := drop.CombinedOutput(); err != nil {
-		fmt.Println()
-		return fmt.Errorf("drop database: %w\n%s", err, out)
-	}
-	fmt.Printf(" %s✓%s\n", green, reset)
+	if metadataStore == "duckdb" {
+		catalogFile := filepath.Join(dataPath, catalogName+".ducklake")
+		fmt.Printf("  Removing catalog   %s%s%s ...", bold, catalogFile, reset)
+		if err := os.Remove(catalogFile); err != nil && !os.IsNotExist(err) {
+			fmt.Println()
+			return fmt.Errorf("remove catalog file: %w", err)
+		}
+		fmt.Printf(" %s✓%s\n", green, reset)
+	} else {
+		// Extract dbname from DSN for the DROP/CREATE commands.
+		dbName := "ducklake_v1"
+		for _, part := range strings.Fields(pgDSN) {
+			if strings.HasPrefix(part, "dbname=") {
+				dbName = strings.TrimPrefix(part, "dbname=")
+			}
+		}
 
-	// Recreate the database.
-	fmt.Printf("  Creating database  %s%s%s ...", bold, dbName, reset)
-	create := exec.Command("psql", "-d", maintDSN, "-c", fmt.Sprintf("CREATE DATABASE %s;", dbName))
-	create.Env = os.Environ()
-	if out, err := create.CombinedOutput(); err != nil {
-		fmt.Println()
-		return fmt.Errorf("create database: %w\n%s", err, out)
+		// Build a maintenance DSN (same host/port/user, but connect to "postgres").
+		maintDSN := strings.ReplaceAll(pgDSN, "dbname="+dbName, "dbname=postgres")
+		if !strings.Contains(maintDSN, "dbname=") {
+			maintDSN = "dbname=postgres " + pgDSN
+		}
+
+		// Drop the database.
+		fmt.Printf("  Dropping database  %s%s%s ...", bold, dbName, reset)
+		drop := exec.Command("psql", "-d", maintDSN, "-c", fmt.Sprintf("DROP DATABASE IF EXISTS %s;", dbName))
+		drop.Env = os.Environ()
+		if out, err := drop.CombinedOutput(); err != nil {
+			fmt.Println()
+			return fmt.Errorf("drop database: %w\n%s", err, out)
+		}
+		fmt.Printf(" %s✓%s\n", green, reset)
+
+		// Recreate the database.
+		fmt.Printf("  Creating database  %s%s%s ...", bold, dbName, reset)
+		create := exec.Command("psql", "-d", maintDSN, "-c", fmt.Sprintf("CREATE DATABASE %s;", dbName))
+		create.Env = os.Environ()
+		if out, err := create.CombinedOutput(); err != nil {
+			fmt.Println()
+			return fmt.Errorf("create database: %w\n%s", err, out)
+		}
+		fmt.Printf(" %s✓%s\n", green, reset)
 	}
-	fmt.Printf(" %s✓%s\n", green, reset)
 
 	// Remove the data directory.
 	fmt.Printf("  Removing data dir  %s%s%s ...", bold, dataPath, reset)
@@ -640,7 +709,7 @@ func runReset(pgDSN, catalogName, dataPath string, force bool) error {
 
 	// Re-run setup to create tables.
 	fmt.Println()
-	return runSetup(pgDSN, catalogName, dataPath)
+	return runSetup(metadataStore, pgDSN, catalogName, dataPath)
 }
 
 func runBatchMode(
@@ -651,6 +720,8 @@ func runBatchMode(
 	batchSize int,
 	numBatches int,
 	checkpointInterval int,
+	distribution string,
+	hotspotDays int,
 	sigCh chan os.Signal,
 ) error {
 	fqt := catalogName + "." + table
@@ -698,7 +769,7 @@ loop:
 		startID := nextID
 		nextID += batchSize
 
-		query := sqlGen(fqt, startID, batchSize)
+		query := sqlGen(fqt, startID, batchSize, distribution, hotspotDays)
 		t0 := time.Now()
 		if _, err := db.Exec(query); err != nil {
 			return fmt.Errorf("batch %d insert: %w", batchNum, err)
@@ -912,9 +983,12 @@ func main() {
 		catalogName        string
 		pgDSN              string
 		dataPath           string
+		metadataStore      string
 		table              string
 		schemaMode         string
 		runMode            string
+		distribution       string
+		hotspotDays        int
 		batchSize          int
 		numBatches         int
 		checkpointInterval int
@@ -943,12 +1017,13 @@ The Postgres database must already exist:
   psql -d postgres -c "CREATE DATABASE ducklake_v1;"`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSetup(pgDSN, catalogName, dataPath)
+			return runSetup(metadataStore, pgDSN, catalogName, dataPath)
 		},
 	}
 
 	setupCmd.Flags().StringVarP(&catalogName, "catalog", "c", "wh", "Catalog alias used inside DuckDB")
-	setupCmd.Flags().StringVar(&pgDSN, "pg-dsn", "dbname=ducklake_v1 host=localhost", "Postgres DSN for the DuckLake metadata store")
+	setupCmd.Flags().StringVar(&metadataStore, "metadata-store", "postgres", "Metadata store backend: 'postgres' or 'duckdb'")
+	setupCmd.Flags().StringVar(&pgDSN, "pg-dsn", "dbname=ducklake_v1 host=localhost", "Postgres DSN for the DuckLake metadata store (postgres mode only)")
 	setupCmd.Flags().StringVar(&dataPath, "data-path", "./ducklake_data", "Directory where Parquet data files are stored")
 
 	// ── Reset command ────────────────────────────────────────────────────────
@@ -962,12 +1037,13 @@ The Postgres database must already exist:
 and re-runs setup to create fresh tables. Prompts for confirmation unless --force is set.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runReset(pgDSN, catalogName, dataPath, forceReset)
+			return runReset(metadataStore, pgDSN, catalogName, dataPath, forceReset)
 		},
 	}
 
 	resetCmd.Flags().StringVarP(&catalogName, "catalog", "c", "wh", "Catalog alias used inside DuckDB")
-	resetCmd.Flags().StringVar(&pgDSN, "pg-dsn", "dbname=ducklake_v1 host=localhost", "Postgres DSN for the DuckLake metadata store")
+	resetCmd.Flags().StringVar(&metadataStore, "metadata-store", "postgres", "Metadata store backend: 'postgres' or 'duckdb'")
+	resetCmd.Flags().StringVar(&pgDSN, "pg-dsn", "dbname=ducklake_v1 host=localhost", "Postgres DSN for the DuckLake metadata store (postgres mode only)")
 	resetCmd.Flags().StringVar(&dataPath, "data-path", "./ducklake_data", "Directory where Parquet data files are stored")
 	resetCmd.Flags().BoolVarP(&forceReset, "force", "f", false, "Skip confirmation prompt")
 
@@ -976,7 +1052,7 @@ and re-runs setup to create fresh tables. Prompts for confirmation unless --forc
 	runCmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run benchmarks on a DuckLake catalog",
-		Long: `Run benchmarks on an existing DuckLake catalog backed by Postgres.
+		Long: `Run benchmarks on an existing DuckLake catalog.
 
 Modes:
   Schema modes (simple, rich):
@@ -1001,6 +1077,12 @@ Modes:
 			if runMode != "batch" && runMode != "ticker" {
 				return fmt.Errorf("--run-mode must be 'batch' or 'ticker', got %q", runMode)
 			}
+			if metadataStore != "postgres" && metadataStore != "duckdb" {
+				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", metadataStore)
+			}
+			if distribution != "uniform" && distribution != "hotspot" {
+				return fmt.Errorf("--distribution must be 'uniform' or 'hotspot', got %q", distribution)
+			}
 			if duplicateRate < 0 || duplicateRate > 1 {
 				return fmt.Errorf("--duplicate-rate must be between 0.0 and 1.0, got %.2f", duplicateRate)
 			}
@@ -1010,12 +1092,22 @@ Modes:
 
 			// ── banner ──────────────────────────────────────────────────────
 			rule("DuckLake Stream Benchmark")
-			fmt.Printf("  Postgres DSN : %s%s%s\n", green, pgDSN, reset)
+			if metadataStore == "duckdb" {
+				catalogFile := filepath.Join(dataPath, catalogName+".ducklake")
+				fmt.Printf("  Metadata store : %sDuckDB%s (%s%s%s)\n", green, reset, green, catalogFile, reset)
+			} else {
+				fmt.Printf("  Metadata store : %sPostgreSQL%s\n", green, reset)
+				fmt.Printf("  Postgres DSN   : %s%s%s\n", green, pgDSN, reset)
+			}
 			fmt.Printf("  Data path    : %s%s%s\n", green, dataPath, reset)
 			fmt.Printf("  Catalog name : %s%s%s\n", green, catalogName, reset)
 			fmt.Printf("  Table        : %s%s.%s%s\n", green, catalogName, table, reset)
 			fmt.Printf("  Schema mode  : %s%s%s\n", green, schemaMode, reset)
 			fmt.Printf("  Run mode     : %s%s%s\n", green, runMode, reset)
+			fmt.Printf("  Distribution : %s%s%s\n", green, distribution, reset)
+			if distribution == "hotspot" {
+				fmt.Printf("  Hotspot span : %s%d days%s\n", green, hotspotDays, reset)
+			}
 
 			if runMode == "batch" {
 				fmt.Printf("  Batch size   : %s%s%s rows\n", green, commas(int64(batchSize)), reset)
@@ -1046,20 +1138,27 @@ Modes:
 				} else {
 					fmt.Printf("  Schema drift : %sdisabled%s\n", green, reset)
 				}
-			}
-			fmt.Println()
+		}
+		fmt.Println()
 
-			// ── open connection ─────────────────────────────────────────────
-			db, err := sql.Open("duckdb", "")
-			if err != nil {
-				return fmt.Errorf("open duckdb: %w", err)
-			}
-			defer db.Close()
+		// ── open connection ─────────────────────────────────────────────
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return fmt.Errorf("open duckdb: %w", err)
+		}
+		defer db.Close()
 
-			attachSQL := buildAttachSQL(pgDSN, catalogName, dataPath)
-			if _, err := db.Exec(attachSQL); err != nil {
-				return fmt.Errorf("attach catalog: %w", err)
+		// For DuckDB mode, ensure data directory exists
+		if metadataStore == "duckdb" {
+			if err := os.MkdirAll(dataPath, 0755); err != nil {
+				return fmt.Errorf("create data directory: %w", err)
 			}
+		}
+
+		attachSQL := buildAttachSQL(metadataStore, pgDSN, catalogName, dataPath)
+		if _, err := db.Exec(attachSQL); err != nil {
+			return fmt.Errorf("attach catalog: %w", err)
+		}
 
 			// ── signal handling ─────────────────────────────────────────────
 			sigCh := make(chan os.Signal, 1)
@@ -1069,16 +1168,19 @@ Modes:
 			if runMode == "ticker" {
 				return runTickerMode(db, catalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, sigCh)
 			}
-			return runBatchMode(db, catalogName, table, schemaMode, batchSize, numBatches, checkpointInterval, sigCh)
+			return runBatchMode(db, catalogName, table, schemaMode, batchSize, numBatches, checkpointInterval, distribution, hotspotDays, sigCh)
 		},
 	}
 
 	runCmd.Flags().StringVarP(&catalogName, "catalog", "c", "wh", "Catalog alias used inside DuckDB")
-	runCmd.Flags().StringVar(&pgDSN, "pg-dsn", "dbname=ducklake_v1 host=localhost", "Postgres DSN for the DuckLake metadata store")
+	runCmd.Flags().StringVar(&metadataStore, "metadata-store", "postgres", "Metadata store backend: 'postgres' or 'duckdb'")
+	runCmd.Flags().StringVar(&pgDSN, "pg-dsn", "dbname=ducklake_v1 host=localhost", "Postgres DSN for the DuckLake metadata store (postgres mode only)")
 	runCmd.Flags().StringVar(&dataPath, "data-path", "./ducklake_data", "Directory where Parquet data files are stored")
 	runCmd.Flags().StringVarP(&table, "table", "t", "", "Target table (defaults to 'events' or 'events_rich')")
 	runCmd.Flags().StringVarP(&schemaMode, "mode", "m", "simple", "Schema mode: simple or rich")
 	runCmd.Flags().StringVarP(&runMode, "run-mode", "r", "batch", "Run mode: batch or ticker")
+	runCmd.Flags().StringVar(&distribution, "distribution", "uniform", "Timestamp distribution: 'uniform' (past 24h) or 'hotspot' (70% in last 6h, 30% spread across --hotspot-days)")
+	runCmd.Flags().IntVar(&hotspotDays, "hotspot-days", 30, "Number of days to spread the 30% tail in hotspot distribution (hotspot mode only)")
 	runCmd.Flags().IntVarP(&batchSize, "batch-size", "b", 100_000, "Rows to insert per batch (batch mode only)")
 	runCmd.Flags().IntVarP(&numBatches, "num-batches", "n", 10, "Number of batches (batch mode only, 0 = forever)")
 	runCmd.Flags().IntVarP(&checkpointInterval, "flush-interval", "k", 10, "Flush inlined rows to Parquet every N batches, or at end if inlined rows > N (0 = never)")
