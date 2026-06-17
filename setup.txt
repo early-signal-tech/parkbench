@@ -1,7 +1,15 @@
--- Start Postgres and create the metadata database
+-- ─────────────────────────────────────────────────────────────────────────────
+-- OPTION A: Postgres-backed catalog
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Prerequisites: start Postgres and create the metadata database
 -- brew services start postgresql@18
 -- psql -d postgres -c "DROP DATABASE IF EXISTS ducklake_v1;"
 -- psql -d postgres -c "CREATE DATABASE ducklake_v1;"
+
+-- parkbench setup
+-- parkbench run
+-- parkbench reset --force
 
 -- Start DuckDB CLI
 duckdb
@@ -10,10 +18,35 @@ duckdb
 INSTALL ducklake;
 LOAD ducklake;
 
--- Attach a Postgres-backed DuckLake catalog
+-- Attach the Postgres-backed DuckLake catalog
 -- DATA_PATH is where Parquet files are written
 ATTACH 'ducklake:postgres:dbname=ducklake_v1 host=localhost' AS wh
     (DATA_PATH './ducklake_data', AUTOMATIC_MIGRATION TRUE);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- OPTION B: DuckDB-backed catalog (no Postgres required)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- No prerequisites — catalog metadata lives at ./ducklake_data/wh.ducklake
+
+-- parkbench setup --metadata-store duckdb
+-- parkbench run   --metadata-store duckdb
+-- parkbench reset --metadata-store duckdb --force
+
+-- Start DuckDB CLI
+duckdb
+
+-- Install and load the ducklake extension
+INSTALL ducklake;
+LOAD ducklake;
+
+-- Attach the DuckDB-backed DuckLake catalog
+ATTACH 'ducklake:duckdb:./ducklake_data/wh.ducklake' AS wh
+    (DATA_PATH './ducklake_data', AUTOMATIC_MIGRATION TRUE);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Common queries (both options)
+-- ─────────────────────────────────────────────────────────────────────────────
 
 -- Create simple schema table
 CREATE TABLE wh.events (

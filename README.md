@@ -1,6 +1,6 @@
 # Parkbench — DuckLake Streaming Benchmark Tool
 
-A high-performance CLI tool for benchmarking DuckLake catalog inserts with flexible path handling and multiple run modes.
+A Go CLI that benchmarks data insertion performance into a DuckLake catalog. Supports two metadata store backends: **PostgreSQL** (default) or **DuckDB** (no Postgres required).
 
 ![Parkbench architecture diagram](parkbench-diagram.svg)
 
@@ -31,9 +31,7 @@ The installer will:
 - Install to `/usr/local/bin/parkbench` (or your custom path)
 - Verify the installation works
 
-## Installation
-
-### Manual Installation
+## Manual Installation
 
 **macOS (Apple Silicon / ARM64):**
 ```bash
@@ -61,151 +59,201 @@ parkbench --help
 
 ## Quick Start
 
-### Setup a new catalog
+### DuckDB metadata store (no Postgres required)
 
 ```bash
-# Create catalog in current directory (default: my_ducklake.ducklake)
+# Setup catalog (creates ./ducklake_data/wh.ducklake)
+parkbench setup --metadata-store duckdb
+
+# Run benchmarks
+parkbench run --metadata-store duckdb
+
+# Reset and start fresh
+parkbench reset --metadata-store duckdb --force
+```
+
+### Postgres metadata store (default)
+
+```bash
+# Prerequisites: Postgres must be running with the catalog database created
+brew services start postgresql@18
+psql -d postgres -c "CREATE DATABASE ducklake_v1;"
+
+# Setup catalog
 parkbench setup
 
-# Create catalog in specific directory with custom name
-parkbench setup /data --catalog prod
-```
-
-### Run benchmarks
-
-```bash
-# Simple schema, batch mode, 10 batches of 100k rows each
+# Run benchmarks
 parkbench run
 
-# Rich schema, ticker mode, 60 seconds of 1 row/sec inserts
-parkbench run --run-mode ticker --mode rich --duration 60
-
-# Custom catalog, specific path
-parkbench run /data --catalog prod --run-mode batch --num-batches 5
+# Reset and start fresh
+parkbench reset --force
 ```
+
+## Metadata Store Backends
+
+The `--metadata-store` flag is available on all commands (`setup`, `run`, `reset`).
+
+| Backend | Flag | Metadata location | Parquet data |
+|---------|------|-------------------|--------------|
+| `postgres` (default) | `--metadata-store postgres` | PostgreSQL database | `./ducklake_data/` |
+| `duckdb` | `--metadata-store duckdb` | `./ducklake_data/wh.ducklake` | `./ducklake_data/` |
+
+Use `--data-path` and `--catalog` to customize both the catalog file location and Parquet data directory.
 
 ## Commands
 
-### `setup [path]` - Initialize a DuckLake catalog
+### `setup` — Initialize a DuckLake catalog
 
-Creates a new DuckLake catalog with both simple and rich schema tables.
+Creates the `events`, `events_rich`, and `events_rejected` tables in the catalog.
 
-**Options:**
-- `-c, --catalog` - Catalog name (default: `my_ducklake`)
-
-**Examples:**
 ```bash
-parkbench setup                          # ./my_ducklake.ducklake
-parkbench setup --catalog test           # ./test.ducklake
-parkbench setup /mnt/data --catalog prod # /mnt/data/prod.ducklake
+parkbench setup
+parkbench setup --metadata-store duckdb
+parkbench setup --metadata-store postgres --pg-dsn "dbname=ducklake_v1 host=localhost" --data-path "./ducklake_data" --catalog wh
 ```
 
-### `run [path]` - Run benchmarks
+**Flags:**
 
-Execute insert benchmarks against an existing DuckLake catalog.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--catalog`, `-c` | `wh` | Catalog alias used inside DuckDB SQL |
+| `--metadata-store` | `postgres` | Metadata store backend: `postgres` or `duckdb` |
+| `--pg-dsn` | `dbname=ducklake_v1 host=localhost` | Postgres DSN (postgres mode only) |
+| `--data-path` | `./ducklake_data` | Directory where Parquet files are written |
 
-**Schema modes:**
-- `simple` (default) - {id, ts, event_type}
-- `rich` - {id, user_id, event_type, ts, payload JSON, metadata JSON}
+### `run` — Benchmark insertion
 
-**Run modes:**
-- `batch` (default) - Insert large batches of rows
-- `ticker` - Insert one row per second for a specified duration
+Inserts rows continuously and prints throughput stats.
 
-**Key options:**
-- `-c, --catalog` - Catalog name (default: `my_ducklake`)
-- `-m, --mode` - Schema mode: simple or rich
-- `-r, --run-mode` - Run mode: batch or ticker
-- `-d, --duration` - Duration in seconds (ticker mode only, default: 60)
-- `-b, --batch-size` - Rows per batch (batch mode only, default: 100,000)
-- `-n, --num-batches` - Number of batches (batch mode only, default: 10, 0 = forever)
-- `-k, --checkpoint-interval` - CHECKPOINT frequency (batch mode only, default: 2, 0 = never)
-
-**Examples:**
 ```bash
-# Ticker mode, current directory
-parkbench run --run-mode ticker --duration 30
+# Batch mode, simple schema (default)
+parkbench run
 
-# Batch mode, custom path and catalog
-parkbench run /data --catalog prod --num-batches 3
+# DuckDB metadata store
+parkbench run --metadata-store duckdb
 
-# Rich schema, ticker mode for 2 minutes
-parkbench run --mode rich --run-mode ticker --duration 120
+# Rich schema
+parkbench run --mode rich
+
+# Ticker mode (1 row/sec for 60s)
+parkbench run --run-mode ticker --duration 60
+
+# Ticker mode with 15% duplicate injection
+parkbench run --run-mode ticker --duration 60 --duplicate-rate 0.15
+
+# Ticker mode with 20% schema drift
+parkbench run --run-mode ticker --duration 60 --schema-drift-rate 0.20
+
+# Run forever
+parkbench run --num-batches 0
 ```
 
-## Path Handling
+**Flags:**
 
-The tool provides flexible path resolution:
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--catalog`, `-c` | `wh` | Catalog alias |
+| `--metadata-store` | `postgres` | Metadata store backend: `postgres` or `duckdb` |
+| `--pg-dsn` | `dbname=ducklake_v1 host=localhost` | Postgres DSN (postgres mode only) |
+| `--data-path` | `./ducklake_data` | Parquet data directory |
+| `--mode`, `-m` | `simple` | Schema mode: `simple` or `rich` |
+| `--run-mode`, `-r` | `batch` | Run mode: `batch` or `ticker` |
+| `--table`, `-t` | _(auto)_ | Table name (defaults to `events` or `events_rich`) |
+| `--batch-size`, `-b` | `100000` | Rows per batch (batch mode only) |
+| `--num-batches`, `-n` | `10` | Number of batches; `0` = run forever |
+| `--flush-interval`, `-k` | `10` | Flush inlined rows to Parquet every N batches (batch mode) or at end if inlined rows > N (ticker mode); `0` = never |
+| `--duration`, `-d` | `60` | Duration in seconds (ticker mode only) |
+| `--duplicate-rate` | `0.0` | Probability (0.0–1.0) of injecting a duplicate row each tick (ticker mode only) |
+| `--schema-drift-rate` | `0.0` | Probability (0.0–1.0) of injecting a schema-breaking row each tick (ticker mode only) |
 
-1. **Default (current directory):**
-   ```bash
-   parkbench setup              # Creates ./my_ducklake.ducklake
-   parkbench run                # Uses ./my_ducklake.ducklake
-   ```
+### `reset` — Drop and recreate the catalog
 
-2. **Custom directory:**
-   ```bash
-   parkbench setup /mnt/data    # Creates /mnt/data/my_ducklake.ducklake
-   parkbench run /mnt/data      # Uses /mnt/data/my_ducklake.ducklake
-   ```
+Wipes all data and re-runs `setup`. For Postgres mode, drops and recreates the database via `psql`. For DuckDB mode, deletes the `.ducklake` catalog file.
 
-3. **Custom catalog name:**
-   ```bash
-   parkbench setup --catalog test           # Creates ./test.ducklake
-   parkbench run --catalog test             # Uses ./test.ducklake
-   ```
-
-4. **Both:**
-   ```bash
-   parkbench setup /mnt/data --catalog prod # Creates /mnt/data/prod.ducklake
-   parkbench run /mnt/data --catalog prod   # Uses /mnt/data/prod.ducklake
-   ```
-
-## Output
-
-Both commands display:
-- Configuration banner
-- Per-operation stats (batch or tick)
-- Row count, inlining ratio, file storage metrics
-- Final summary with overall throughput
-
-### Batch Mode Example
-```
-╭─ Batch 1    ──────────────────────────────────────────╮
-│ Batch                          10 / 10 │
-│ Batch rows inserted         100,000 │
-│ Batch throughput         1,234,567 rows/sec │
-│ Overall throughput       1,234,567 rows/sec │
-│ Total rows (COUNT)         100,000 │
-│ Inlined rows                100.0% │
-│ File-stored rows                0 │
-│ Parquet file count              0 │
-╰────────────────────────────────────────────╯
+```bash
+parkbench reset               # prompts "yes" to confirm (postgres)
+parkbench reset --force       # skip confirmation (postgres)
+parkbench reset --metadata-store duckdb --force
 ```
 
-### Ticker Mode Example
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--catalog`, `-c` | `wh` | Catalog alias |
+| `--metadata-store` | `postgres` | Metadata store backend: `postgres` or `duckdb` |
+| `--pg-dsn` | `dbname=ducklake_v1 host=localhost` | Postgres DSN (postgres mode only) |
+| `--data-path` | `./ducklake_data` | Parquet data directory to remove |
+| `--force`, `-f` | `false` | Skip confirmation prompt |
+
+## Querying from DuckDB CLI
+
+Run `duckdb` from the same working directory used by `parkbench run`, then:
+
+### Postgres-backed catalog
+
+```sql
+INSTALL ducklake;
+LOAD ducklake;
+ATTACH 'ducklake:postgres:dbname=ducklake_v1 host=localhost' AS wh
+  (DATA_PATH './ducklake_data', AUTOMATIC_MIGRATION TRUE);
+
+SELECT COUNT(*) FROM wh.events;
+SELECT * FROM wh.events LIMIT 10;
 ```
-╭─ Tick 1     ────────────────────────────────────────╮
-│ Tick number                     1 │
-│ Total rows (COUNT)              1 │
-│ Inlined rows           1  (100.0%) │
-│ File-stored rows           0  (0%) │
-│ Parquet file count              0 │
-│ Overall throughput         0 rows/sec │
-╰────────────────────────────────────────╯
+
+### DuckDB-backed catalog
+
+```sql
+INSTALL ducklake;
+LOAD ducklake;
+ATTACH 'ducklake:duckdb:./ducklake_data/wh.ducklake' AS wh
+  (DATA_PATH './ducklake_data', AUTOMATIC_MIGRATION TRUE);
+
+SELECT COUNT(*) FROM wh.events;
+SELECT * FROM wh.events LIMIT 10;
+```
+
+### Useful queries
+
+```sql
+-- Check schema-drift rejections
+SELECT COUNT(*) FROM wh.events_rejected WHERE anomaly_type = 'schema_drift';
+SELECT * FROM wh.events_rejected ORDER BY rejected_at DESC LIMIT 10;
+
+-- Check DuckLake settings
+SELECT * FROM ducklake_settings('wh');
+```
+
+## Schema Modes
+
+**simple** — `wh.events`
+```sql
+id INTEGER, ts TIMESTAMP, event_type VARCHAR
+```
+
+**rich** — `wh.events_rich`
+```sql
+id INTEGER, user_id VARCHAR, event_type VARCHAR, ts TIMESTAMP, payload JSON, metadata JSON
+```
+
+**rejected (dead letter)** — `wh.events_rejected`
+```sql
+rejected_at TIMESTAMP, source_table VARCHAR, anomaly_type VARCHAR,
+attempted_id INTEGER, error_message VARCHAR, payload JSON
 ```
 
 ## Building
 
 ```bash
-go build -o parkbench main.go
+go build -o parkbench .
 ```
 
 ## Requirements
 
 - Go 1.24.0+
-- DuckDB (via duckdb-go driver)
-- DuckLake support in DuckDB
+- DuckDB via `github.com/duckdb/duckdb-go/v2`
+- PostgreSQL (only for `--metadata-store postgres`)
 
 ## Development
 
