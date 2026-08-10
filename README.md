@@ -1,6 +1,6 @@
 # Parkbench — DuckLake Streaming Benchmark Tool
 
-A Go CLI that benchmarks data insertion performance into a DuckLake catalog. Supports two metadata store backends: **PostgreSQL** (default) or **DuckDB** (no Postgres required).
+A Go CLI that benchmarks data insertion performance into a DuckLake catalog. Metadata can live in **PostgreSQL** (local or remote/managed, e.g. Supabase) or a local **DuckDB** file, and Parquet data can be written to the **local filesystem** or **S3**. Connections can be passed inline via flags, or resolved from a **persistent DuckDB secret** (`CREATE PERSISTENT SECRET`) so credentials never need to be typed into the CLI at all — see [Remote Catalogs & DuckDB Secrets](#remote-catalogs--duckdb-secrets).
 
 ![Parkbench architecture diagram](parkbench-diagram.svg)
 
@@ -95,10 +95,73 @@ The `--metadata-store` flag is available on all commands (`setup`, `run`, `reset
 
 | Backend | Flag | Metadata location | Parquet data |
 |---------|------|-------------------|--------------|
-| `postgres` (default) | `--metadata-store postgres` | PostgreSQL database | `./ducklake_data/` |
-| `duckdb` | `--metadata-store duckdb` | `./ducklake_data/wh.ducklake` | `./ducklake_data/` |
+| `postgres` (default) | `--metadata-store postgres` | Any PostgreSQL database — local, or remote/managed like Supabase | Local directory or `s3://bucket/prefix` |
+| `duckdb` | `--metadata-store duckdb` | Local `./ducklake_data/wh.ducklake` file | Local directory |
 
-Use `--data-path` and `--catalog` to customize both the catalog file location and Parquet data directory.
+Use `--data-path` and `--catalog` to customize both the catalog location and Parquet data path. See [Remote Catalogs & DuckDB Secrets](#remote-catalogs--duckdb-secrets) below for connecting to Supabase + S3.
+
+## Remote Catalogs & DuckDB Secrets
+
+Parkbench can reach a DuckLake catalog three ways. All three work with `setup`, `run`, and `reset`.
+
+### 1. Inline, local (default) — zero config
+
+```bash
+parkbench setup   # local Postgres (dbname=ducklake_v1 host=localhost) + ./ducklake_data
+parkbench run
+```
+
+### 2. Inline, remote — pass credentials directly
+
+`--pg-dsn` accepts any Postgres DSN, and `--data-path` accepts an `s3://bucket/prefix` URI. When the data path is S3, parkbench creates a **temporary, in-memory** S3 secret for that session only — nothing is written to disk.
+
+```bash
+parkbench setup \
+  --pg-dsn "host=db.xxxx.supabase.co port=5432 dbname=postgres user=postgres password=*** sslmode=require" \
+  --metadata-schema ducklake_meta \
+  --data-path "s3://my-bucket/prefix" \
+  --s3-key-id AKIA... --s3-secret-key ... --s3-region us-east-1
+```
+
+`--s3-key-id`/`--s3-secret-key`/`--s3-region` fall back to the `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION` environment variables, so you can omit them from the command line entirely:
+
+```bash
+export AWS_ACCESS_KEY_ID=AKIA...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_REGION=us-east-1
+parkbench setup --pg-dsn "host=db.xxxx.supabase.co ... sslmode=require" --data-path "s3://my-bucket/prefix"
+```
+
+`--metadata-schema` maps to DuckLake's `METADATA_SCHEMA` option, scoping the catalog to a single Postgres schema (e.g. `ducklake_meta`) instead of `public`, so unrelated tables/schemas in a shared database don't show up.
+
+### 3. Named persistent secret — one flag, no credentials on the command line
+
+This mirrors the `CREATE PERSISTENT SECRET` pattern from [DuckLake in Production: Catalog and Storage](https://thefulldatastack.substack.com/p/ducklake-in-production-catalog-storage). Create the secrets once (either via the `parkbench secrets` subcommand below, or the `duckdb` CLI directly), then reference them by name forever after:
+
+```bash
+parkbench secrets create-postgres --name supabase_pg \
+  --host db.xxxx.supabase.co --database postgres --user postgres --password ***
+
+parkbench secrets create-ducklake --name ducklake_prod \
+  --data-path "s3://my-bucket/prefix" \
+  --metadata-secret supabase_pg \
+  --metadata-schema ducklake_meta
+
+parkbench setup --ducklake-secret ducklake_prod
+parkbench run   --ducklake-secret ducklake_prod --num-batches 0
+```
+
+Persistent secrets live in DuckDB's local, unencrypted secret store and are available across any DuckDB or parkbench session on the machine, regardless of working directory. For shared/production environments, prefer creating secrets yourself via the `duckdb` CLI so credentials never pass through this tool's flags or process list.
+
+### `secrets` — manage persistent DuckDB secrets
+
+```bash
+parkbench secrets create-s3       --name s3_bucket   --key-id ... --secret-key ... --region us-east-1
+parkbench secrets create-postgres --name supabase_pg --host ... --database postgres --user postgres --password ...
+parkbench secrets create-ducklake --name ducklake_prod --data-path s3://bucket/prefix --metadata-secret supabase_pg --metadata-schema ducklake_meta
+parkbench secrets list
+parkbench secrets drop <name>
+```
 
 ## Commands
 
@@ -110,6 +173,7 @@ Creates the `events`, `events_rich`, and `events_rejected` tables in the catalog
 parkbench setup
 parkbench setup --metadata-store duckdb
 parkbench setup --metadata-store postgres --pg-dsn "dbname=ducklake_v1 host=localhost" --data-path "./ducklake_data" --catalog wh
+parkbench setup --ducklake-secret ducklake_prod
 ```
 
 **Flags:**
@@ -117,9 +181,13 @@ parkbench setup --metadata-store postgres --pg-dsn "dbname=ducklake_v1 host=loca
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--catalog`, `-c` | `wh` | Catalog alias used inside DuckDB SQL |
-| `--metadata-store` | `postgres` | Metadata store backend: `postgres` or `duckdb` |
-| `--pg-dsn` | `dbname=ducklake_v1 host=localhost` | Postgres DSN (postgres mode only) |
-| `--data-path` | `./ducklake_data` | Directory where Parquet files are written |
+| `--ducklake-secret` | _(none)_ | Name of a pre-created persistent `DUCKLAKE` secret; when set, all flags below are ignored |
+| `--metadata-catalog-name` | _(none)_ | Expose DuckLake's metadata tables under this name in DuckDB (`METADATA_CATALOG`) |
+| `--metadata-store` | `postgres` | Metadata store backend: `postgres` or `duckdb` (ignored with `--ducklake-secret`) |
+| `--pg-dsn` | `dbname=ducklake_v1 host=localhost` | Postgres DSN — local or remote/managed, e.g. Supabase (postgres mode only) |
+| `--metadata-schema` | _(none)_ | Postgres schema for DuckLake's metadata tables (`METADATA_SCHEMA`); defaults to `public` (postgres mode only) |
+| `--data-path` | `./ducklake_data` | Where Parquet files are written: a local directory, or an `s3://bucket/prefix` URI |
+| `--s3-key-id` / `--s3-secret-key` / `--s3-region` | _(none)_ | S3 credentials, used only when `--data-path` is `s3://...`; fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` |
 
 ### `run` — Benchmark insertion
 
@@ -146,6 +214,9 @@ parkbench run --run-mode ticker --duration 60 --schema-drift-rate 0.20
 
 # Run forever
 parkbench run --num-batches 0
+
+# Against a remote catalog via a named secret
+parkbench run --ducklake-secret ducklake_prod --num-batches 0
 ```
 
 **Flags:**
@@ -153,9 +224,13 @@ parkbench run --num-batches 0
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--catalog`, `-c` | `wh` | Catalog alias |
-| `--metadata-store` | `postgres` | Metadata store backend: `postgres` or `duckdb` |
-| `--pg-dsn` | `dbname=ducklake_v1 host=localhost` | Postgres DSN (postgres mode only) |
-| `--data-path` | `./ducklake_data` | Parquet data directory |
+| `--ducklake-secret` | _(none)_ | Name of a pre-created persistent `DUCKLAKE` secret; when set, connection flags below are ignored |
+| `--metadata-catalog-name` | _(none)_ | Expose DuckLake's metadata tables under this name in DuckDB (`METADATA_CATALOG`) |
+| `--metadata-store` | `postgres` | Metadata store backend: `postgres` or `duckdb` (ignored with `--ducklake-secret`) |
+| `--pg-dsn` | `dbname=ducklake_v1 host=localhost` | Postgres DSN — local or remote/managed, e.g. Supabase (postgres mode only) |
+| `--metadata-schema` | _(none)_ | Postgres schema for DuckLake's metadata tables (`METADATA_SCHEMA`); defaults to `public` (postgres mode only) |
+| `--data-path` | `./ducklake_data` | Parquet data directory: a local directory, or an `s3://bucket/prefix` URI |
+| `--s3-key-id` / `--s3-secret-key` / `--s3-region` | _(none)_ | S3 credentials, used only when `--data-path` is `s3://...`; fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` |
 | `--mode`, `-m` | `simple` | Schema mode: `simple` or `rich` |
 | `--run-mode`, `-r` | `batch` | Run mode: `batch` or `ticker` |
 | `--table`, `-t` | _(auto)_ | Table name (defaults to `events` or `events_rich`) |
@@ -168,22 +243,24 @@ parkbench run --num-batches 0
 
 ### `reset` — Drop and recreate the catalog
 
-Wipes all data and re-runs `setup`. For Postgres mode, drops and recreates the database via `psql`. For DuckDB mode, deletes the `.ducklake` catalog file.
+Behavior depends on whether the catalog is local or remote:
+
+- **Local** (local Postgres + local data path, or `--metadata-store duckdb`): drops and recreates the Postgres database via `psql` (or deletes the `.ducklake` file), and wipes the local data directory — the original destructive behavior, unchanged.
+- **Remote** (remote/managed Postgres, S3 data path, or `--ducklake-secret`): parkbench doesn't own that shared infrastructure outright, so instead it just drops the DuckLake-tracked tables (`events`, `events_rich`, `events_rejected`) inside the catalog. Parquet files already written to S3 are **not** deleted automatically — a note is printed suggesting a lifecycle rule or manual `aws s3 rm` if you need a full wipe.
+
+Either way, `setup` is re-run afterward to recreate fresh tables.
 
 ```bash
-parkbench reset               # prompts "yes" to confirm (postgres)
-parkbench reset --force       # skip confirmation (postgres)
+parkbench reset               # prompts "yes" to confirm (local postgres)
+parkbench reset --force       # skip confirmation
 parkbench reset --metadata-store duckdb --force
+parkbench reset --ducklake-secret ducklake_prod --force   # drops tables only, leaves Supabase/S3 infra intact
 ```
 
-**Flags:**
+**Flags:** same connection flags as `setup`/`run` (see above), plus:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--catalog`, `-c` | `wh` | Catalog alias |
-| `--metadata-store` | `postgres` | Metadata store backend: `postgres` or `duckdb` |
-| `--pg-dsn` | `dbname=ducklake_v1 host=localhost` | Postgres DSN (postgres mode only) |
-| `--data-path` | `./ducklake_data` | Parquet data directory to remove |
 | `--force`, `-f` | `false` | Skip confirmation prompt |
 
 ## Querying from DuckDB CLI

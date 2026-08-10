@@ -15,15 +15,12 @@
 package main
 
 import (
-	"bufio"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
-	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -553,163 +550,34 @@ func recordRejectedEvent(
 
 // ── run loops ──────────────────────────────────────────────────────────────
 
-func buildAttachSQL(metadataStore, pgDSN, catalogName, dataPath string) string {
-	if dataPath == "" {
-		dataPath = "."
-	}
-	if metadataStore == "duckdb" {
-		catalogFile := filepath.Join(dataPath, catalogName+".ducklake")
-		return fmt.Sprintf(
-			"ATTACH 'ducklake:duckdb:%s' AS %s (DATA_PATH '%s', AUTOMATIC_MIGRATION TRUE)",
-			catalogFile, catalogName, dataPath,
-		)
-	}
-	return fmt.Sprintf(
-		"ATTACH 'ducklake:postgres:%s' AS %s (DATA_PATH '%s', AUTOMATIC_MIGRATION TRUE)",
-		pgDSN, catalogName, dataPath,
-	)
-}
-
-func runSetup(metadataStore, pgDSN, catalogName, dataPath string) error {
-	// For DuckDB mode, ensure data directory exists first
-	if metadataStore == "duckdb" {
-		if err := os.MkdirAll(dataPath, 0755); err != nil {
-			return fmt.Errorf("create data directory: %w", err)
-		}
-	}
-
-	db, err := sql.Open("duckdb", "")
+func runSetup(cfg ConnectionConfig) error {
+	db, err := openAndAttach(cfg)
 	if err != nil {
-		return fmt.Errorf("open duckdb: %w", err)
+		return err
 	}
 	defer db.Close()
 
-	attachSQL := buildAttachSQL(metadataStore, pgDSN, catalogName, dataPath)
-	if _, err := db.Exec(attachSQL); err != nil {
-		return fmt.Errorf("attach catalog: %w", err)
-	}
-
-	simpleFQT := catalogName + ".events"
+	simpleFQT := cfg.CatalogName + ".events"
 	if _, err := db.Exec(fmt.Sprintf(simpleDDL, simpleFQT)); err != nil {
 		return fmt.Errorf("create simple table: %w", err)
 	}
 
-	richFQT := catalogName + ".events_rich"
+	richFQT := cfg.CatalogName + ".events_rich"
 	if _, err := db.Exec(fmt.Sprintf(richDDL, richFQT)); err != nil {
 		return fmt.Errorf("create rich table: %w", err)
 	}
 
-	if err := createRejectedEventsTable(db, catalogName); err != nil {
+	if err := createRejectedEventsTable(db, cfg.CatalogName); err != nil {
 		return fmt.Errorf("create rejected events table: %w", err)
 	}
 
 	rule("DuckLake Setup Complete")
-	if metadataStore == "duckdb" {
-		catalogFile := filepath.Join(dataPath, catalogName+".ducklake")
-		fmt.Printf("  Metadata store : %sDuckDB%s (%s%s%s)\n", green, reset, green, catalogFile, reset)
-	} else {
-		fmt.Printf("  Metadata store : %sPostgreSQL%s\n", green, reset)
-		fmt.Printf("  Postgres DSN   : %s%s%s\n", green, pgDSN, reset)
-	}
-	fmt.Printf("  Data path    : %s%s%s\n", green, dataPath, reset)
-	fmt.Printf("  Catalog name : %s%s%s\n", green, catalogName, reset)
+	printConnectionSummary(cfg)
 	fmt.Printf("  Tables       : %s%s.events, %s.events_rich, %s.%s%s\n",
-		green, catalogName, catalogName, catalogName, rejectedEventsTable, reset)
+		green, cfg.CatalogName, cfg.CatalogName, cfg.CatalogName, rejectedEventsTable, reset)
 	fmt.Println()
 	fmt.Printf("%s✓ Setup complete. Ready for benchmarking!%s\n", green, reset)
 	return nil
-}
-
-func runReset(metadataStore, pgDSN, catalogName, dataPath string, force bool) error {
-	if !force {
-		fmt.Printf("%s%sWARNING:%s This will permanently delete:\n", bold, yellow, reset)
-		if metadataStore == "duckdb" {
-			catalogFile := filepath.Join(dataPath, catalogName+".ducklake")
-			fmt.Printf("  • Catalog file      : %s%s%s\n", bold, catalogFile, reset)
-		} else {
-			dbName := "ducklake_v1"
-			for _, part := range strings.Fields(pgDSN) {
-				if strings.HasPrefix(part, "dbname=") {
-					dbName = strings.TrimPrefix(part, "dbname=")
-				}
-			}
-			fmt.Printf("  • Postgres database : %s%s%s\n", bold, dbName, reset)
-		}
-		fmt.Printf("  • Data directory    : %s%s%s\n", bold, dataPath, reset)
-		fmt.Printf("\nType %syes%s to continue: ", bold, reset)
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Scan()
-		if strings.TrimSpace(scanner.Text()) != "yes" {
-			fmt.Printf("%sReset cancelled.%s\n", yellow, reset)
-			return nil
-		}
-	}
-
-	rule("DuckLake Reset")
-
-	if metadataStore == "duckdb" {
-		catalogFile := filepath.Join(dataPath, catalogName+".ducklake")
-		fmt.Printf("  Removing catalog   %s%s%s ...", bold, catalogFile, reset)
-		if err := os.Remove(catalogFile); err != nil && !os.IsNotExist(err) {
-			fmt.Println()
-			return fmt.Errorf("remove catalog file: %w", err)
-		}
-		fmt.Printf(" %s✓%s\n", green, reset)
-	} else {
-		// Extract dbname from DSN for the DROP/CREATE commands.
-		dbName := "ducklake_v1"
-		for _, part := range strings.Fields(pgDSN) {
-			if strings.HasPrefix(part, "dbname=") {
-				dbName = strings.TrimPrefix(part, "dbname=")
-			}
-		}
-
-		// Build a maintenance DSN (same host/port/user, but connect to "postgres").
-		maintDSN := strings.ReplaceAll(pgDSN, "dbname="+dbName, "dbname=postgres")
-		if !strings.Contains(maintDSN, "dbname=") {
-			maintDSN = "dbname=postgres " + pgDSN
-		}
-
-		// Drop the database.
-		fmt.Printf("  Dropping database  %s%s%s ...", bold, dbName, reset)
-		drop := exec.Command("psql", "-d", maintDSN, "-c", fmt.Sprintf("DROP DATABASE IF EXISTS %s;", dbName))
-		drop.Env = os.Environ()
-		if out, err := drop.CombinedOutput(); err != nil {
-			fmt.Println()
-			return fmt.Errorf("drop database: %w\n%s", err, out)
-		}
-		fmt.Printf(" %s✓%s\n", green, reset)
-
-		// Recreate the database.
-		fmt.Printf("  Creating database  %s%s%s ...", bold, dbName, reset)
-		create := exec.Command("psql", "-d", maintDSN, "-c", fmt.Sprintf("CREATE DATABASE %s;", dbName))
-		create.Env = os.Environ()
-		if out, err := create.CombinedOutput(); err != nil {
-			fmt.Println()
-			return fmt.Errorf("create database: %w\n%s", err, out)
-		}
-		fmt.Printf(" %s✓%s\n", green, reset)
-	}
-
-	// Remove the data directory.
-	fmt.Printf("  Removing data dir  %s%s%s ...", bold, dataPath, reset)
-	if err := os.RemoveAll(dataPath); err != nil {
-		fmt.Println()
-		return fmt.Errorf("remove data directory: %w", err)
-	}
-	fmt.Printf(" %s✓%s\n", green, reset)
-
-	// Remove the flush state file.
-	fmt.Printf("  Removing state     %s%s%s ...", bold, stateFileName, reset)
-	if err := os.Remove(stateFileName); err != nil && !os.IsNotExist(err) {
-		fmt.Println()
-		return fmt.Errorf("remove state file: %w", err)
-	}
-	fmt.Printf(" %s✓%s\n", green, reset)
-
-	// Re-run setup to create tables.
-	fmt.Println()
-	return runSetup(metadataStore, pgDSN, catalogName, dataPath)
 }
 
 func runBatchMode(
@@ -718,6 +586,8 @@ func runBatchMode(
 	table string,
 	schemaMode string,
 	batchSize int,
+	batchSizeMin int,
+	batchSizeMax int,
 	numBatches int,
 	checkpointInterval int,
 	distribution string,
@@ -765,18 +635,34 @@ loop:
 		default:
 		}
 
-		batchNum++
-		startID := nextID
-		nextID += batchSize
-
-		query := sqlGen(fqt, startID, batchSize, distribution, hotspotDays)
-		t0 := time.Now()
-		if _, err := db.Exec(query); err != nil {
-			return fmt.Errorf("batch %d insert: %w", batchNum, err)
+	batchNum++
+	startID := nextID
+	
+	// Use randomized batch size if min/max provided, otherwise use fixed batchSize
+	currentBatchSize := batchSize
+	if batchSizeMin > 0 || batchSizeMax > 0 {
+		min, max := batchSizeMin, batchSizeMax
+		if min <= 0 {
+			min = 1
 		}
-		batchSecs := time.Since(t0).Seconds()
+		if max <= 0 {
+			max = batchSize
+		}
+		if min > max {
+			min, max = max, min
+		}
+		currentBatchSize = min + rand.Intn(max-min+1)
+	}
+	nextID += currentBatchSize
 
-		cumulative += int64(batchSize)
+	query := sqlGen(fqt, startID, currentBatchSize, distribution, hotspotDays)
+	t0 := time.Now()
+	if _, err := db.Exec(query); err != nil {
+		return fmt.Errorf("batch %d insert: %w", batchNum, err)
+	}
+	batchSecs := time.Since(t0).Seconds()
+
+	cumulative += int64(currentBatchSize)
 		elapsedTotal := time.Since(startTotal).Seconds()
 
 		if checkpointInterval > 0 && batchNum%checkpointInterval == 0 {
@@ -787,9 +673,9 @@ loop:
 			flushInfo = fmt.Sprintf("%.2fs", time.Since(f0).Seconds())
 		}
 
-		s := getStorageStats(db, catalogName, table)
-		printStats(batchNum, numBatches, batchSize, batchSecs,
-			cumulative, elapsedTotal, s, flushInfo)
+	s := getStorageStats(db, catalogName, table)
+	printStats(batchNum, numBatches, currentBatchSize, batchSecs,
+		cumulative, elapsedTotal, s, flushInfo)
 	}
 
 	elapsedTotal := time.Since(startTotal).Seconds()
@@ -980,20 +866,18 @@ loop:
 
 func main() {
 	var (
-		catalogName        string
-		pgDSN              string
-		dataPath           string
-		metadataStore      string
 		table              string
 		schemaMode         string
 		runMode            string
 		distribution       string
 		hotspotDays        int
 		batchSize          int
+		batchSizeMin       int
+		batchSizeMax       int
 		numBatches         int
 		checkpointInterval int
 		duration           int
-		duplicateRate       float64
+		duplicateRate      float64
 		schemaDriftRate    float64
 	)
 
@@ -1002,52 +886,63 @@ func main() {
 		Short: "DuckLake streaming benchmark tool",
 		Long: `Parkbench — A DuckLake streaming benchmark tool for testing data insertion performance.
 
-Supports setup and run operations with flexible path handling.`,
+Supports setup and run operations against any DuckLake catalog: a local
+Postgres + local filesystem for quick dev, a remote Postgres (e.g. Supabase)
+with S3 storage for production, or a named persistent DuckDB secret bundling
+both.`,
 	}
 
 	// ── Setup command ───────────────────────────────────────────────────────
 
+	var setupConn ConnectionConfig
+
 	setupCmd := &cobra.Command{
 		Use:   "setup",
-		Short: "Initialize a new DuckLake catalog backed by Postgres",
-		Long: `Initialize a new DuckLake catalog using a local Postgres database as the
-metadata store. Parquet data files are written to --data-path.
+		Short: "Initialize a new DuckLake catalog",
+		Long: `Initialize a new DuckLake catalog. Parquet data files are written to
+--data-path (a local directory or an s3:// URI), backed by a Postgres or
+local DuckDB metadata store, or by a pre-created --ducklake-secret.
 
-The Postgres database must already exist:
+If using a local Postgres metadata store, the database must already exist:
   psql -d postgres -c "CREATE DATABASE ducklake_v1;"`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSetup(metadataStore, pgDSN, catalogName, dataPath)
+			if setupConn.DucklakeSecret == "" && setupConn.MetadataStore != "postgres" && setupConn.MetadataStore != "duckdb" {
+				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", setupConn.MetadataStore)
+			}
+			return runSetup(setupConn)
 		},
 	}
-
-	setupCmd.Flags().StringVarP(&catalogName, "catalog", "c", "wh", "Catalog alias used inside DuckDB")
-	setupCmd.Flags().StringVar(&metadataStore, "metadata-store", "postgres", "Metadata store backend: 'postgres' or 'duckdb'")
-	setupCmd.Flags().StringVar(&pgDSN, "pg-dsn", "dbname=ducklake_v1 host=localhost", "Postgres DSN for the DuckLake metadata store (postgres mode only)")
-	setupCmd.Flags().StringVar(&dataPath, "data-path", "./ducklake_data", "Directory where Parquet data files are stored")
+	registerConnectionFlags(setupCmd, &setupConn)
 
 	// ── Reset command ────────────────────────────────────────────────────────
 
+	var resetConn ConnectionConfig
 	var forceReset bool
 
 	resetCmd := &cobra.Command{
 		Use:   "reset",
 		Short: "Drop and recreate the DuckLake catalog from scratch",
-		Long: `Drops the Postgres metadata database, removes the Parquet data directory,
-and re-runs setup to create fresh tables. Prompts for confirmation unless --force is set.`,
+		Long: `For local catalogs (local Postgres + local data path), drops and recreates
+the Postgres database and wipes the local data directory. For remote
+catalogs (remote/managed Postgres, S3 storage, or --ducklake-secret),
+instead drops just the DuckLake-tracked tables, since parkbench doesn't own
+that shared infrastructure outright. Either way, re-runs setup afterward.
+Prompts for confirmation unless --force is set.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runReset(metadataStore, pgDSN, catalogName, dataPath, forceReset)
+			if resetConn.DucklakeSecret == "" && resetConn.MetadataStore != "postgres" && resetConn.MetadataStore != "duckdb" {
+				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", resetConn.MetadataStore)
+			}
+			return runReset(resetConn, forceReset)
 		},
 	}
-
-	resetCmd.Flags().StringVarP(&catalogName, "catalog", "c", "wh", "Catalog alias used inside DuckDB")
-	resetCmd.Flags().StringVar(&metadataStore, "metadata-store", "postgres", "Metadata store backend: 'postgres' or 'duckdb'")
-	resetCmd.Flags().StringVar(&pgDSN, "pg-dsn", "dbname=ducklake_v1 host=localhost", "Postgres DSN for the DuckLake metadata store (postgres mode only)")
-	resetCmd.Flags().StringVar(&dataPath, "data-path", "./ducklake_data", "Directory where Parquet data files are stored")
+	registerConnectionFlags(resetCmd, &resetConn)
 	resetCmd.Flags().BoolVarP(&forceReset, "force", "f", false, "Skip confirmation prompt")
 
 	// ── Run command ─────────────────────────────────────────────────────────
+
+	var runConn ConnectionConfig
 
 	runCmd := &cobra.Command{
 		Use:   "run",
@@ -1077,8 +972,8 @@ Modes:
 			if runMode != "batch" && runMode != "ticker" {
 				return fmt.Errorf("--run-mode must be 'batch' or 'ticker', got %q", runMode)
 			}
-			if metadataStore != "postgres" && metadataStore != "duckdb" {
-				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", metadataStore)
+			if runConn.DucklakeSecret == "" && runConn.MetadataStore != "postgres" && runConn.MetadataStore != "duckdb" {
+				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", runConn.MetadataStore)
 			}
 			if distribution != "uniform" && distribution != "hotspot" {
 				return fmt.Errorf("--distribution must be 'uniform' or 'hotspot', got %q", distribution)
@@ -1092,16 +987,8 @@ Modes:
 
 			// ── banner ──────────────────────────────────────────────────────
 			rule("DuckLake Stream Benchmark")
-			if metadataStore == "duckdb" {
-				catalogFile := filepath.Join(dataPath, catalogName+".ducklake")
-				fmt.Printf("  Metadata store : %sDuckDB%s (%s%s%s)\n", green, reset, green, catalogFile, reset)
-			} else {
-				fmt.Printf("  Metadata store : %sPostgreSQL%s\n", green, reset)
-				fmt.Printf("  Postgres DSN   : %s%s%s\n", green, pgDSN, reset)
-			}
-			fmt.Printf("  Data path    : %s%s%s\n", green, dataPath, reset)
-			fmt.Printf("  Catalog name : %s%s%s\n", green, catalogName, reset)
-			fmt.Printf("  Table        : %s%s.%s%s\n", green, catalogName, table, reset)
+			printConnectionSummary(runConn)
+			fmt.Printf("  Table        : %s%s.%s%s\n", green, runConn.CatalogName, table, reset)
 			fmt.Printf("  Schema mode  : %s%s%s\n", green, schemaMode, reset)
 			fmt.Printf("  Run mode     : %s%s%s\n", green, runMode, reset)
 			fmt.Printf("  Distribution : %s%s%s\n", green, distribution, reset)
@@ -1138,50 +1025,37 @@ Modes:
 				} else {
 					fmt.Printf("  Schema drift : %sdisabled%s\n", green, reset)
 				}
-		}
-		fmt.Println()
-
-		// ── open connection ─────────────────────────────────────────────
-		db, err := sql.Open("duckdb", "")
-		if err != nil {
-			return fmt.Errorf("open duckdb: %w", err)
-		}
-		defer db.Close()
-
-		// For DuckDB mode, ensure data directory exists
-		if metadataStore == "duckdb" {
-			if err := os.MkdirAll(dataPath, 0755); err != nil {
-				return fmt.Errorf("create data directory: %w", err)
 			}
-		}
+			fmt.Println()
 
-		attachSQL := buildAttachSQL(metadataStore, pgDSN, catalogName, dataPath)
-		if _, err := db.Exec(attachSQL); err != nil {
-			return fmt.Errorf("attach catalog: %w", err)
-		}
+			// ── open connection ─────────────────────────────────────────────
+			db, err := openAndAttach(runConn)
+			if err != nil {
+				return err
+			}
+			defer db.Close()
 
 			// ── signal handling ─────────────────────────────────────────────
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-			// ── run selected mode ───────────────────────────────────────────
-			if runMode == "ticker" {
-				return runTickerMode(db, catalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, sigCh)
-			}
-			return runBatchMode(db, catalogName, table, schemaMode, batchSize, numBatches, checkpointInterval, distribution, hotspotDays, sigCh)
+		// ── run selected mode ───────────────────────────────────────────
+		if runMode == "ticker" {
+			return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, sigCh)
+		}
+		return runBatchMode(db, runConn.CatalogName, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, checkpointInterval, distribution, hotspotDays, sigCh)
 		},
 	}
 
-	runCmd.Flags().StringVarP(&catalogName, "catalog", "c", "wh", "Catalog alias used inside DuckDB")
-	runCmd.Flags().StringVar(&metadataStore, "metadata-store", "postgres", "Metadata store backend: 'postgres' or 'duckdb'")
-	runCmd.Flags().StringVar(&pgDSN, "pg-dsn", "dbname=ducklake_v1 host=localhost", "Postgres DSN for the DuckLake metadata store (postgres mode only)")
-	runCmd.Flags().StringVar(&dataPath, "data-path", "./ducklake_data", "Directory where Parquet data files are stored")
+	registerConnectionFlags(runCmd, &runConn)
 	runCmd.Flags().StringVarP(&table, "table", "t", "", "Target table (defaults to 'events' or 'events_rich')")
 	runCmd.Flags().StringVarP(&schemaMode, "mode", "m", "simple", "Schema mode: simple or rich")
 	runCmd.Flags().StringVarP(&runMode, "run-mode", "r", "batch", "Run mode: batch or ticker")
 	runCmd.Flags().StringVar(&distribution, "distribution", "uniform", "Timestamp distribution: 'uniform' (past 24h) or 'hotspot' (70% in last 6h, 30% spread across --hotspot-days)")
 	runCmd.Flags().IntVar(&hotspotDays, "hotspot-days", 30, "Number of days to spread the 30% tail in hotspot distribution (hotspot mode only)")
-	runCmd.Flags().IntVarP(&batchSize, "batch-size", "b", 100_000, "Rows to insert per batch (batch mode only)")
+	runCmd.Flags().IntVarP(&batchSize, "batch-size", "b", 100_000, "Fixed number of rows to insert per batch (batch mode only); overridden if --batch-size-min/--batch-size-max are set")
+	runCmd.Flags().IntVar(&batchSizeMin, "batch-size-min", 0, "Minimum batch size for randomization (batch mode only); if set with --batch-size-max, each batch gets a random size in [min, max]")
+	runCmd.Flags().IntVar(&batchSizeMax, "batch-size-max", 0, "Maximum batch size for randomization (batch mode only); if set with --batch-size-min, each batch gets a random size in [min, max]")
 	runCmd.Flags().IntVarP(&numBatches, "num-batches", "n", 10, "Number of batches (batch mode only, 0 = forever)")
 	runCmd.Flags().IntVarP(&checkpointInterval, "flush-interval", "k", 10, "Flush inlined rows to Parquet every N batches, or at end if inlined rows > N (0 = never)")
 	runCmd.Flags().IntVarP(&duration, "duration", "d", 60, "Duration in seconds (ticker mode only)")
@@ -1193,6 +1067,7 @@ Modes:
 	rootCmd.AddCommand(setupCmd)
 	rootCmd.AddCommand(resetCmd)
 	rootCmd.AddCommand(runCmd)
+	rootCmd.AddCommand(newSecretsCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
