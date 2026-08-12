@@ -114,15 +114,16 @@ func sqlArray(ss []string) string {
 	return "[" + strings.Join(quoted, ", ") + "]"
 }
 
-// sqlArrayPostgres formats a string array as a Postgres ARRAY literal
+// sqlArrayPostgres formats a string array as a Postgres ARRAY literal. The
+// surrounding parentheses are required: Postgres rejects subscripting an array
+// constructor directly (ARRAY[...][1] is a syntax error, (ARRAY[...])[1] is not).
 func sqlArrayPostgres(ss []string) string {
 	quoted := make([]string, len(ss))
 	for i, s := range ss {
-		// Escape single quotes in the string
 		escaped := strings.ReplaceAll(s, "'", "''")
 		quoted[i] = "'" + escaped + "'"
 	}
-	return "ARRAY[" + strings.Join(quoted, ", ") + "]"
+	return "(ARRAY[" + strings.Join(quoted, ", ") + "])"
 }
 
 // ── SQL generation ────────────────────────────────────────────────────────────
@@ -211,88 +212,80 @@ func batchSQLRich(fqt string, startID, batchSize int, distribution string, hotsp
 	)
 }
 
-// ── Postgres-specific batch SQL (uses standard SQL, no DuckDB extensions) ────
+// ── Postgres-specific batch SQL (standard SQL, no DuckDB extensions) ─────────
+//
+// The DuckDB generators rely on range(), struct literals and INTERVAL <expr>
+// SECOND, none of which Postgres accepts, so the postgres sink needs its own
+// generators. Row ids come straight off generate_series so they match the
+// DuckDB versions' startID..startID+batchSize-1 range.
+
+// pgTimestampExpr renders the timestamp expression for a distribution using
+// Postgres interval arithmetic.
+func pgTimestampExpr(distribution string, hotspotDays int) string {
+	switch distribution {
+	case "hotspot":
+		tailSeconds := hotspotDays*24*3600 - 21600
+		return fmt.Sprintf(`CASE
+				WHEN random() < 0.7 THEN now() - (random() * 21600)::int * INTERVAL '1 second'
+				ELSE now() - (21600 + random() * %d)::int * INTERVAL '1 second'
+			END`, tailSeconds)
+	case "yesterday":
+		return "(CURRENT_DATE - 1)::timestamp + (random() * 86400)::int * INTERVAL '1 second'"
+	case "last_week":
+		return "now() - (random() * 604800)::int * INTERVAL '1 second'"
+	default:
+		return "now() - (random() * 86400)::int * INTERVAL '1 second'"
+	}
+}
+
+// pgPick renders a uniform random element of ss.
+func pgPick(ss []string) string {
+	return fmt.Sprintf("%s[1 + floor(random() * %d)::int]", sqlArrayPostgres(ss), len(ss))
+}
 
 func batchSQLSimplePostgres(fqt string, startID, batchSize int, distribution string, hotspotDays int) string {
-	var tsExpr string
-	if distribution == "hotspot" {
-		// 70% in last 6 hours, 30% spread across past N days
-		oldestSeconds := hotspotDays * 24 * 3600
-		tsExpr = fmt.Sprintf(`CASE
-			WHEN random() < 0.7 THEN now() - (random() * 21600)::int * '1 second'::interval
-			ELSE now() - ((21600 + random() * %d)::int) * '1 second'::interval
-		END`, oldestSeconds-21600)
-	} else if distribution == "yesterday" {
-		// timestamps only for the previous day
-		tsExpr = "(CURRENT_DATE - INTERVAL '1 day')::timestamp + (random() * 86400)::int * '1 second'::interval"
-	} else if distribution == "last_week" {
-		// timestamps for the past 7 days
-		tsExpr = "now() - (random() * 604800)::int * '1 second'::interval"
-	} else {
-		// default: uniform across past 24 hours
-		tsExpr = "now() - (random() * 86400)::int * '1 second'::interval"
-	}
-
-	// Generate VALUES clause for Postgres
 	return fmt.Sprintf(`
 		INSERT INTO %s (id, ts, event_type)
 		SELECT
-			row_number() OVER () + %d AS id,
-			%s AS ts,
-			%s[((random() * %d)::int %% %d) + 1] AS event_type
-		FROM generate_series(1, %d)`,
-		fqt, startID,
-		tsExpr,
-		sqlArrayPostgres(eventTypes), len(eventTypes), len(eventTypes),
-		batchSize,
+			i                AS id,
+			%s               AS ts,
+			%s               AS event_type
+		FROM generate_series(%d, %d) AS s(i)`,
+		fqt,
+		pgTimestampExpr(distribution, hotspotDays),
+		pgPick(eventTypes),
+		startID, startID+batchSize-1,
 	)
 }
 
 func batchSQLRichPostgres(fqt string, startID, batchSize int, distribution string, hotspotDays int) string {
-	var tsExpr string
-	if distribution == "hotspot" {
-		oldestSeconds := hotspotDays * 24 * 3600
-		tsExpr = fmt.Sprintf(`CASE
-			WHEN random() < 0.7 THEN now() - (random() * 21600)::int * '1 second'::interval
-			ELSE now() - ((21600 + random() * %d)::int) * '1 second'::interval
-		END`, oldestSeconds-21600)
-	} else if distribution == "yesterday" {
-		tsExpr = "(CURRENT_DATE - INTERVAL '1 day')::timestamp + (random() * 86400)::int * '1 second'::interval"
-	} else if distribution == "last_week" {
-		tsExpr = "now() - (random() * 604800)::int * '1 second'::interval"
-	} else {
-		tsExpr = "now() - (random() * 86400)::int * '1 second'::interval"
-	}
-
-	// Build JSON payload inline
-	payloadExpr := fmt.Sprintf(`jsonb_build_object(
-		'event_type', %s[((random() * %d)::int %% %d) + 1],
-		'page', %s[((random() * %d)::int %% %d) + 1],
-		'source', %s[((random() * %d)::int %% %d) + 1],
-		'country', %s[((random() * %d)::int %% %d) + 1]
-	)`,
-		sqlArrayPostgres(eventTypes), len(eventTypes), len(eventTypes),
-		sqlArrayPostgres(pages), len(pages), len(pages),
-		sqlArrayPostgres(sources), len(sources), len(sources),
-		sqlArrayPostgres(countries), len(countries), len(countries),
-	)
-
 	return fmt.Sprintf(`
 		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata)
 		SELECT
-			row_number() OVER () + %d AS id,
-			%s[((random() * %d)::int %% %d) + 1] AS user_id,
-			%s[((random() * %d)::int %% %d) + 1] AS event_type,
-			%s AS ts,
-			%s AS payload,
-			jsonb_build_object('timestamp', now()) AS metadata
-		FROM generate_series(1, %d)`,
-		fqt, startID,
-		sqlArrayPostgres(streamUsers), len(streamUsers), len(streamUsers),
-		sqlArrayPostgres(eventTypes), len(eventTypes), len(eventTypes),
-		tsExpr,
-		payloadExpr,
-		batchSize,
+			i          AS id,
+			%s         AS user_id,
+			%s         AS event_type,
+			%s         AS ts,
+			json_build_object(
+				'page',        %s,
+				'duration_ms', (100 + (random() * 9900)::int),
+				'value',       round((random() * 499.99 + 0.01)::numeric, 2)
+			)          AS payload,
+			json_build_object(
+				'source',     %s,
+				'country',    %s,
+				'session_id', 'sess_' || (1 + (random() * 999999)::bigint)::text,
+				'ab_variant', CASE WHEN random() > 0.5 THEN 'A' ELSE 'B' END
+			)          AS metadata
+		FROM generate_series(%d, %d) AS s(i)`,
+		fqt,
+		pgPick(streamUsers),
+		pgPick(eventTypes),
+		pgTimestampExpr(distribution, hotspotDays),
+		pgPick(pages),
+		pgPick(sources),
+		pgPick(countries),
+		startID, startID+batchSize-1,
 	)
 }
 
@@ -397,6 +390,63 @@ func tickerSQLRich(fqt string, id int, userID string) string {
 		1+id%999999,
 		map[int]string{0: "A", 1: "B"}[id%2],
 	)
+}
+
+// The DuckDB ticker generators above use struct literals ({...}::JSON), so the
+// postgres sink needs json_build_object equivalents.
+
+func tickerSQLSimplePostgres(fqt string, id int) string {
+	return fmt.Sprintf(`
+		INSERT INTO %s (id, ts, event_type)
+		VALUES (%d, now(), '%s')`,
+		fqt, id, eventTypes[id%len(eventTypes)],
+	)
+}
+
+func tickerSQLRichPostgres(fqt string, id int, userID string) string {
+	return fmt.Sprintf(`
+		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata)
+		VALUES (
+			%d,
+			'%s',
+			'%s',
+			now(),
+			json_build_object(
+				'page',        '%s',
+				'duration_ms', %d,
+				'value',       %.2f
+			),
+			json_build_object(
+				'source',     '%s',
+				'country',    '%s',
+				'session_id', 'sess_%d',
+				'ab_variant', '%s'
+			)
+		)`,
+		fqt,
+		id,
+		userID,
+		eventTypes[id%len(eventTypes)],
+		pages[id%len(pages)],
+		100+id%9900,
+		float64(id)*0.01+0.01,
+		sources[id%len(sources)],
+		countries[id%len(countries)],
+		1+id%999999,
+		map[int]string{0: "A", 1: "B"}[id%2],
+	)
+}
+
+// tickerSQLDriftedPostgres targets a column that doesn't exist, so Postgres
+// rejects the insert — the postgres-sink equivalent of the DuckLake drift
+// injection, minus the dead-letter table.
+func tickerSQLDriftedPostgres(fqt string, id int, schemaMode string) string {
+	if schemaMode == "rich" {
+		return fmt.Sprintf(
+			`INSERT INTO %s (id, schema_version) VALUES (%d, 'v2')`, fqt, id)
+	}
+	return fmt.Sprintf(
+		`INSERT INTO %s (id, event_category) VALUES (%d, 'engagement')`, fqt, id)
 }
 
 // ── storage stats ─────────────────────────────────────────────────────────────
@@ -693,6 +743,19 @@ func runSetup(cfg ConnectionConfig) error {
 	return nil
 }
 
+// ensurePostgresSchema creates the configured schema if one was requested.
+// Both setup and run call this: run creates its target table on the fly, so it
+// needs the schema to exist even when setup was never run.
+func ensurePostgresSchema(db *sql.DB, cfg ConnectionConfig) error {
+	if cfg.PostgresSchema == "" {
+		return nil
+	}
+	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS " + cfg.PostgresSchema); err != nil {
+		return fmt.Errorf("create schema %s: %w", cfg.PostgresSchema, err)
+	}
+	return nil
+}
+
 func runSetupPostgresSink(cfg ConnectionConfig) error {
 	db, err := openPostgres(cfg)
 	if err != nil {
@@ -700,12 +763,8 @@ func runSetupPostgresSink(cfg ConnectionConfig) error {
 	}
 	defer db.Close()
 
-	// Create schema if it doesn't exist (and is specified)
-	if cfg.PostgresSchema != "" {
-		createSchemaDDL := fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", cfg.PostgresSchema)
-		if _, err := db.Exec(createSchemaDDL); err != nil {
-			return fmt.Errorf("create schema: %w", err)
-		}
+	if err := ensurePostgresSchema(db, cfg); err != nil {
+		return err
 	}
 
 	// Create source tables for both simple and rich schemas
@@ -1041,6 +1100,10 @@ func runBatchModePostgresSink(
 	// Use schema-qualified table name if schema is specified
 	fqt := cfg.getPostgresTableName(table)
 
+	if err := ensurePostgresSchema(db, cfg); err != nil {
+		return err
+	}
+
 	// Create table if it doesn't exist
 	ddl := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 		id          INTEGER,
@@ -1154,6 +1217,10 @@ func runTickerModePostgresSink(
 	// Use schema-qualified table name if schema is specified
 	fqt := cfg.getPostgresTableName(table)
 
+	if err := ensurePostgresSchema(db, cfg); err != nil {
+		return err
+	}
+
 	// Create table if it doesn't exist
 	ddl := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 		id          INTEGER,
@@ -1184,6 +1251,8 @@ func runTickerModePostgresSink(
 
 	var (
 		cumulative int64
+		dupCount   int64
+		driftCount int64
 		startTotal = time.Now()
 		tickNum    int
 	)
@@ -1207,13 +1276,13 @@ loop:
 			id := nextID
 			nextID++
 
-		var query string
-		if schemaMode == "rich" {
-			userID := streamUsers[rand.Intn(len(streamUsers))]
-			query = tickerSQLRich(fqt, int(id), userID)
-		} else {
-			query = tickerSQLSimple(fqt, int(id))
-		}
+			var query string
+			if schemaMode == "rich" {
+				userID := streamUsers[rand.Intn(len(streamUsers))]
+				query = tickerSQLRichPostgres(fqt, int(id), userID)
+			} else {
+				query = tickerSQLSimplePostgres(fqt, int(id))
+			}
 
 			if _, err := db.Exec(query); err != nil {
 				return fmt.Errorf("tick %d insert: %w", tickNum, err)
@@ -1225,7 +1294,18 @@ loop:
 				if _, err := db.Exec(query); err != nil {
 					fmt.Fprintf(os.Stderr, "warning: duplicate inject failed at tick %d: %v\n", tickNum, err)
 				} else {
+					dupCount++
 					cumulative++
+				}
+			}
+
+			// Inject a schema-drift row with probability schemaDriftRate. The
+			// drifted insert names a column the table doesn't have, so Postgres
+			// rejects it — simulating a source system emitting a new field.
+			if schemaDriftRate > 0 && rand.Float64() < schemaDriftRate {
+				if _, err := db.Exec(tickerSQLDriftedPostgres(fqt, int(id), schemaMode)); err != nil {
+					driftCount++
+					fmt.Printf("\n%s⚠  Schema drift at tick %d:%s %v\n", red+bold, tickNum, reset, err)
 				}
 			}
 
@@ -1248,6 +1328,14 @@ loop:
 		elapsedTotal,
 		commas(int64(overall)),
 	)
+	if dupCount > 0 {
+		fmt.Printf("%s  ↳ %s duplicate rows injected (duplicate rate %.0f%%)%s\n",
+			yellow, commas(dupCount), duplicateRate*100, reset)
+	}
+	if driftCount > 0 {
+		fmt.Printf("%s  ↳ %s schema drift errors (drift rate %.0f%%)%s\n",
+			red, commas(driftCount), schemaDriftRate*100, reset)
+	}
 	return nil
 }
 
@@ -1347,9 +1435,14 @@ Modes:
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if table == "" {
-				if schemaMode == "rich" {
+				switch {
+				case runConn.isPostgresSink() && schemaMode == "rich":
+					table = "events_rich_source"
+				case runConn.isPostgresSink():
+					table = "events_source"
+				case schemaMode == "rich":
 					table = "events_rich"
-				} else {
+				default:
 					table = "events"
 				}
 			}
@@ -1373,15 +1466,14 @@ Modes:
 			}
 
 		// ── banner ──────────────────────────────────────────────────────
-		if runConn.isPostgresSink() {
+		postgresSink := runConn.isPostgresSink()
+		if postgresSink {
 			rule("Postgres Source Data Load")
+			fmt.Printf("  Postgres DSN : %s%s%s\n", green, runConn.PgDSN, reset)
+			fmt.Printf("  Table        : %s%s%s\n", green, runConn.getPostgresTableName(table), reset)
 		} else {
 			rule("DuckLake Stream Benchmark")
-		}
-		printConnectionSummary(runConn)
-		if runConn.isPostgresSink() {
-			fmt.Printf("  Table        : %s%s%s\n", green, table, reset)
-		} else {
+			printConnectionSummary(runConn)
 			fmt.Printf("  Table        : %s%s.%s%s\n", green, runConn.CatalogName, table, reset)
 		}
 			fmt.Printf("  Schema mode  : %s%s%s\n", green, schemaMode, reset)
@@ -1392,23 +1484,46 @@ Modes:
 			}
 
 			if runMode == "batch" {
-				fmt.Printf("  Batch size   : %s%s%s rows\n", green, commas(int64(batchSize)), reset)
+				// Report the randomized range when it's in effect, since the
+				// fixed --batch-size is ignored in that case.
+				if batchSizeMin > 0 || batchSizeMax > 0 {
+					lo, hi := batchSizeMin, batchSizeMax
+					if lo <= 0 {
+						lo = 1
+					}
+					if hi <= 0 {
+						hi = batchSize
+					}
+					if lo > hi {
+						lo, hi = hi, lo
+					}
+					fmt.Printf("  Batch size   : %s%s–%s%s rows (random per batch)\n",
+						green, commas(int64(lo)), commas(int64(hi)), reset)
+				} else {
+					fmt.Printf("  Batch size   : %s%s%s rows\n", green, commas(int64(batchSize)), reset)
+				}
 				if numBatches == 0 {
 					fmt.Printf("  Batches      : %s∞%s\n", green, reset)
 				} else {
 					fmt.Printf("  Batches      : %s%d%s\n", green, numBatches, reset)
 				}
-				if checkpointInterval == 0 {
-					fmt.Printf("  Flush        : %sdisabled%s\n", green, reset)
-				} else {
-					fmt.Printf("  Flush        : every %s%d%s batches\n", green, checkpointInterval, reset)
+				// Flushing is a DuckLake inlining concern; it has no meaning
+				// when writing straight to Postgres.
+				if !postgresSink {
+					if checkpointInterval == 0 {
+						fmt.Printf("  Flush        : %sdisabled%s\n", green, reset)
+					} else {
+						fmt.Printf("  Flush        : every %s%d%s batches\n", green, checkpointInterval, reset)
+					}
 				}
 			} else if runMode == "ticker" {
 				fmt.Printf("  Duration     : %s%d%s seconds\n", green, duration, reset)
-				if checkpointInterval == 0 {
-					fmt.Printf("  Flush        : %sdisabled%s (no flush at end)\n", green, reset)
-				} else {
-					fmt.Printf("  Flush        : at end if inlined rows > %s%d%s\n", green, checkpointInterval, reset)
+				if !postgresSink {
+					if checkpointInterval == 0 {
+						fmt.Printf("  Flush        : %sdisabled%s (no flush at end)\n", green, reset)
+					} else {
+						fmt.Printf("  Flush        : at end if inlined rows > %s%d%s\n", green, checkpointInterval, reset)
+					}
 				}
 				if duplicateRate > 0 {
 					fmt.Printf("  Duplicate rate : %s%.0f%%%s duplicate rows\n", yellow, duplicateRate*100, reset)
