@@ -219,18 +219,18 @@ func batchSQLSimplePostgres(fqt string, startID, batchSize int, distribution str
 		// 70% in last 6 hours, 30% spread across past N days
 		oldestSeconds := hotspotDays * 24 * 3600
 		tsExpr = fmt.Sprintf(`CASE
-			WHEN random() < 0.7 THEN now() - (random() * 21600)::text || ' seconds'::interval
-			ELSE now() - ((21600 + random() * %d)::int)::text || ' seconds'::interval
+			WHEN random() < 0.7 THEN now() - (random() * 21600)::int * '1 second'::interval
+			ELSE now() - ((21600 + random() * %d)::int) * '1 second'::interval
 		END`, oldestSeconds-21600)
 	} else if distribution == "yesterday" {
 		// timestamps only for the previous day
-		tsExpr = "CURRENT_DATE - 1 + (random() * 86400)::text || ' seconds'::interval"
+		tsExpr = "(CURRENT_DATE - INTERVAL '1 day')::timestamp + (random() * 86400)::int * '1 second'::interval"
 	} else if distribution == "last_week" {
 		// timestamps for the past 7 days
-		tsExpr = "now() - (random() * 604800)::text || ' seconds'::interval"
+		tsExpr = "now() - (random() * 604800)::int * '1 second'::interval"
 	} else {
 		// default: uniform across past 24 hours
-		tsExpr = "now() - (random() * 86400)::text || ' seconds'::interval"
+		tsExpr = "now() - (random() * 86400)::int * '1 second'::interval"
 	}
 
 	// Generate VALUES clause for Postgres
@@ -253,15 +253,15 @@ func batchSQLRichPostgres(fqt string, startID, batchSize int, distribution strin
 	if distribution == "hotspot" {
 		oldestSeconds := hotspotDays * 24 * 3600
 		tsExpr = fmt.Sprintf(`CASE
-			WHEN random() < 0.7 THEN now() - (random() * 21600)::text || ' seconds'::interval
-			ELSE now() - ((21600 + random() * %d)::int)::text || ' seconds'::interval
+			WHEN random() < 0.7 THEN now() - (random() * 21600)::int * '1 second'::interval
+			ELSE now() - ((21600 + random() * %d)::int) * '1 second'::interval
 		END`, oldestSeconds-21600)
 	} else if distribution == "yesterday" {
-		tsExpr = "CURRENT_DATE - 1 + (random() * 86400)::text || ' seconds'::interval"
+		tsExpr = "(CURRENT_DATE - INTERVAL '1 day')::timestamp + (random() * 86400)::int * '1 second'::interval"
 	} else if distribution == "last_week" {
-		tsExpr = "now() - (random() * 604800)::text || ' seconds'::interval"
+		tsExpr = "now() - (random() * 604800)::int * '1 second'::interval"
 	} else {
-		tsExpr = "now() - (random() * 86400)::text || ' seconds'::interval"
+		tsExpr = "now() - (random() * 86400)::int * '1 second'::interval"
 	}
 
 	// Build JSON payload inline
