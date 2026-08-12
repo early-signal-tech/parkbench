@@ -124,6 +124,12 @@ func batchSQLSimple(fqt string, startID, batchSize int, distribution string, hot
 			WHEN random() < 0.7 THEN now() - INTERVAL (random() * 21600) SECOND
 			ELSE now() - INTERVAL (21600 + random() * %d) SECOND
 		END`, oldestSeconds-21600)
+	} else if distribution == "yesterday" {
+		// timestamps only for the previous day
+		tsExpr = "CAST(CURRENT_DATE() - 1 AS TIMESTAMP) + INTERVAL (random() * 86400) SECOND"
+	} else if distribution == "last_week" {
+		// timestamps for the past 7 days
+		tsExpr = "now() - INTERVAL (random() * 604800) SECOND"
 	} else {
 		// default: uniform across past 24 hours
 		tsExpr = "now() - INTERVAL (random() * 86400) SECOND"
@@ -152,6 +158,12 @@ func batchSQLRich(fqt string, startID, batchSize int, distribution string, hotsp
 			WHEN random() < 0.7 THEN now() - INTERVAL (random() * 21600) SECOND
 			ELSE now() - INTERVAL (21600 + random() * %d) SECOND
 		END`, oldestSeconds-21600)
+	} else if distribution == "yesterday" {
+		// timestamps only for the previous day
+		tsExpr = "CAST(CURRENT_DATE() - 1 AS TIMESTAMP) + INTERVAL (random() * 86400) SECOND"
+	} else if distribution == "last_week" {
+		// timestamps for the past 7 days
+		tsExpr = "now() - INTERVAL (random() * 604800) SECOND"
 	} else {
 		// default: uniform across past 24 hours
 		tsExpr = "now() - INTERVAL (random() * 86400) SECOND"
@@ -975,8 +987,8 @@ Modes:
 			if runConn.DucklakeSecret == "" && runConn.MetadataStore != "postgres" && runConn.MetadataStore != "duckdb" {
 				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", runConn.MetadataStore)
 			}
-			if distribution != "uniform" && distribution != "hotspot" {
-				return fmt.Errorf("--distribution must be 'uniform' or 'hotspot', got %q", distribution)
+			if distribution != "uniform" && distribution != "hotspot" && distribution != "yesterday" && distribution != "last_week" {
+				return fmt.Errorf("--distribution must be 'uniform', 'hotspot', 'yesterday', or 'last_week', got %q", distribution)
 			}
 			if duplicateRate < 0 || duplicateRate > 1 {
 				return fmt.Errorf("--duplicate-rate must be between 0.0 and 1.0, got %.2f", duplicateRate)
@@ -1051,7 +1063,7 @@ Modes:
 	runCmd.Flags().StringVarP(&table, "table", "t", "", "Target table (defaults to 'events' or 'events_rich')")
 	runCmd.Flags().StringVarP(&schemaMode, "mode", "m", "simple", "Schema mode: simple or rich")
 	runCmd.Flags().StringVarP(&runMode, "run-mode", "r", "batch", "Run mode: batch or ticker")
-	runCmd.Flags().StringVar(&distribution, "distribution", "uniform", "Timestamp distribution: 'uniform' (past 24h) or 'hotspot' (70% in last 6h, 30% spread across --hotspot-days)")
+	runCmd.Flags().StringVar(&distribution, "distribution", "uniform", "Timestamp distribution: 'uniform' (past 24h), 'hotspot' (70% in last 6h, 30% spread), 'yesterday' (previous day only), or 'last_week' (past 7 days)")
 	runCmd.Flags().IntVar(&hotspotDays, "hotspot-days", 30, "Number of days to spread the 30% tail in hotspot distribution (hotspot mode only)")
 	runCmd.Flags().IntVarP(&batchSize, "batch-size", "b", 100_000, "Fixed number of rows to insert per batch (batch mode only); overridden if --batch-size-min/--batch-size-max are set")
 	runCmd.Flags().IntVar(&batchSizeMin, "batch-size-min", 0, "Minimum batch size for randomization (batch mode only); if set with --batch-size-max, each batch gets a random size in [min, max]")
