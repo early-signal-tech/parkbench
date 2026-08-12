@@ -26,6 +26,7 @@ import (
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+	_ "github.com/lib/pq"
 	"github.com/spf13/cobra"
 )
 
@@ -113,6 +114,18 @@ func sqlArray(ss []string) string {
 	return "[" + strings.Join(quoted, ", ") + "]"
 }
 
+// sqlArrayPostgres formats a string array as a Postgres ARRAY literal. The
+// surrounding parentheses are required: Postgres rejects subscripting an array
+// constructor directly (ARRAY[...][1] is a syntax error, (ARRAY[...])[1] is not).
+func sqlArrayPostgres(ss []string) string {
+	quoted := make([]string, len(ss))
+	for i, s := range ss {
+		escaped := strings.ReplaceAll(s, "'", "''")
+		quoted[i] = "'" + escaped + "'"
+	}
+	return "(ARRAY[" + strings.Join(quoted, ", ") + "])"
+}
+
 // ── SQL generation ────────────────────────────────────────────────────────────
 
 func batchSQLSimple(fqt string, startID, batchSize int, distribution string, hotspotDays int) string {
@@ -196,6 +209,83 @@ func batchSQLRich(fqt string, startID, batchSize int, distribution string, hotsp
 		sqlArray(sources), len(sources)-1,
 		sqlArray(countries), len(countries)-1,
 		batchSize,
+	)
+}
+
+// ── Postgres-specific batch SQL (standard SQL, no DuckDB extensions) ─────────
+//
+// The DuckDB generators rely on range(), struct literals and INTERVAL <expr>
+// SECOND, none of which Postgres accepts, so the postgres sink needs its own
+// generators. Row ids come straight off generate_series so they match the
+// DuckDB versions' startID..startID+batchSize-1 range.
+
+// pgTimestampExpr renders the timestamp expression for a distribution using
+// Postgres interval arithmetic.
+func pgTimestampExpr(distribution string, hotspotDays int) string {
+	switch distribution {
+	case "hotspot":
+		tailSeconds := hotspotDays*24*3600 - 21600
+		return fmt.Sprintf(`CASE
+				WHEN random() < 0.7 THEN now() - (random() * 21600)::int * INTERVAL '1 second'
+				ELSE now() - (21600 + random() * %d)::int * INTERVAL '1 second'
+			END`, tailSeconds)
+	case "yesterday":
+		return "(CURRENT_DATE - 1)::timestamp + (random() * 86400)::int * INTERVAL '1 second'"
+	case "last_week":
+		return "now() - (random() * 604800)::int * INTERVAL '1 second'"
+	default:
+		return "now() - (random() * 86400)::int * INTERVAL '1 second'"
+	}
+}
+
+// pgPick renders a uniform random element of ss.
+func pgPick(ss []string) string {
+	return fmt.Sprintf("%s[1 + floor(random() * %d)::int]", sqlArrayPostgres(ss), len(ss))
+}
+
+func batchSQLSimplePostgres(fqt string, startID, batchSize int, distribution string, hotspotDays int) string {
+	return fmt.Sprintf(`
+		INSERT INTO %s (id, ts, event_type)
+		SELECT
+			i                AS id,
+			%s               AS ts,
+			%s               AS event_type
+		FROM generate_series(%d, %d) AS s(i)`,
+		fqt,
+		pgTimestampExpr(distribution, hotspotDays),
+		pgPick(eventTypes),
+		startID, startID+batchSize-1,
+	)
+}
+
+func batchSQLRichPostgres(fqt string, startID, batchSize int, distribution string, hotspotDays int) string {
+	return fmt.Sprintf(`
+		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata)
+		SELECT
+			i          AS id,
+			%s         AS user_id,
+			%s         AS event_type,
+			%s         AS ts,
+			json_build_object(
+				'page',        %s,
+				'duration_ms', (100 + (random() * 9900)::int),
+				'value',       round((random() * 499.99 + 0.01)::numeric, 2)
+			)          AS payload,
+			json_build_object(
+				'source',     %s,
+				'country',    %s,
+				'session_id', 'sess_' || (1 + (random() * 999999)::bigint)::text,
+				'ab_variant', CASE WHEN random() > 0.5 THEN 'A' ELSE 'B' END
+			)          AS metadata
+		FROM generate_series(%d, %d) AS s(i)`,
+		fqt,
+		pgPick(streamUsers),
+		pgPick(eventTypes),
+		pgTimestampExpr(distribution, hotspotDays),
+		pgPick(pages),
+		pgPick(sources),
+		pgPick(countries),
+		startID, startID+batchSize-1,
 	)
 }
 
@@ -300,6 +390,63 @@ func tickerSQLRich(fqt string, id int, userID string) string {
 		1+id%999999,
 		map[int]string{0: "A", 1: "B"}[id%2],
 	)
+}
+
+// The DuckDB ticker generators above use struct literals ({...}::JSON), so the
+// postgres sink needs json_build_object equivalents.
+
+func tickerSQLSimplePostgres(fqt string, id int) string {
+	return fmt.Sprintf(`
+		INSERT INTO %s (id, ts, event_type)
+		VALUES (%d, now(), '%s')`,
+		fqt, id, eventTypes[id%len(eventTypes)],
+	)
+}
+
+func tickerSQLRichPostgres(fqt string, id int, userID string) string {
+	return fmt.Sprintf(`
+		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata)
+		VALUES (
+			%d,
+			'%s',
+			'%s',
+			now(),
+			json_build_object(
+				'page',        '%s',
+				'duration_ms', %d,
+				'value',       %.2f
+			),
+			json_build_object(
+				'source',     '%s',
+				'country',    '%s',
+				'session_id', 'sess_%d',
+				'ab_variant', '%s'
+			)
+		)`,
+		fqt,
+		id,
+		userID,
+		eventTypes[id%len(eventTypes)],
+		pages[id%len(pages)],
+		100+id%9900,
+		float64(id)*0.01+0.01,
+		sources[id%len(sources)],
+		countries[id%len(countries)],
+		1+id%999999,
+		map[int]string{0: "A", 1: "B"}[id%2],
+	)
+}
+
+// tickerSQLDriftedPostgres targets a column that doesn't exist, so Postgres
+// rejects the insert — the postgres-sink equivalent of the DuckLake drift
+// injection, minus the dead-letter table.
+func tickerSQLDriftedPostgres(fqt string, id int, schemaMode string) string {
+	if schemaMode == "rich" {
+		return fmt.Sprintf(
+			`INSERT INTO %s (id, schema_version) VALUES (%d, 'v2')`, fqt, id)
+	}
+	return fmt.Sprintf(
+		`INSERT INTO %s (id, event_category) VALUES (%d, 'engagement')`, fqt, id)
 }
 
 // ── storage stats ─────────────────────────────────────────────────────────────
@@ -563,6 +710,10 @@ func recordRejectedEvent(
 // ── run loops ──────────────────────────────────────────────────────────────
 
 func runSetup(cfg ConnectionConfig) error {
+	if cfg.isPostgresSink() {
+		return runSetupPostgresSink(cfg)
+	}
+
 	db, err := openAndAttach(cfg)
 	if err != nil {
 		return err
@@ -589,6 +740,61 @@ func runSetup(cfg ConnectionConfig) error {
 		green, cfg.CatalogName, cfg.CatalogName, cfg.CatalogName, rejectedEventsTable, reset)
 	fmt.Println()
 	fmt.Printf("%s✓ Setup complete. Ready for benchmarking!%s\n", green, reset)
+	return nil
+}
+
+// ensurePostgresSchema creates the configured schema if one was requested.
+// Both setup and run call this: run creates its target table on the fly, so it
+// needs the schema to exist even when setup was never run.
+func ensurePostgresSchema(db *sql.DB, cfg ConnectionConfig) error {
+	if cfg.PostgresSchema == "" {
+		return nil
+	}
+	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS " + cfg.PostgresSchema); err != nil {
+		return fmt.Errorf("create schema %s: %w", cfg.PostgresSchema, err)
+	}
+	return nil
+}
+
+func runSetupPostgresSink(cfg ConnectionConfig) error {
+	db, err := openPostgres(cfg)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if err := ensurePostgresSchema(db, cfg); err != nil {
+		return err
+	}
+
+	// Create source tables for both simple and rich schemas
+	simpleTable := cfg.getPostgresTableName("events_source")
+	simpleDDL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		id          INTEGER,
+		ts          TIMESTAMP,
+		event_type  VARCHAR
+	)`, simpleTable)
+	if _, err := db.Exec(simpleDDL); err != nil {
+		return fmt.Errorf("create %s table: %w", simpleTable, err)
+	}
+
+	richTable := cfg.getPostgresTableName("events_rich_source")
+	richDDL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		id          INTEGER,
+		user_id     VARCHAR,
+		event_type  VARCHAR,
+		ts          TIMESTAMP,
+		payload     JSON,
+		metadata    JSON
+	)`, richTable)
+	if _, err := db.Exec(richDDL); err != nil {
+		return fmt.Errorf("create %s table: %w", richTable, err)
+	}
+
+	rule("Postgres Source Setup Complete")
+	fmt.Printf("  Tables       : %s%s, %s%s\n", green, simpleTable, richTable, reset)
+	fmt.Println()
+	fmt.Printf("%s✓ Setup complete. Ready for data loading!%s\n", green, reset)
 	return nil
 }
 
@@ -876,6 +1082,263 @@ loop:
 	return nil
 }
 
+// ── postgres sink modes (simplified, no metrics) ────────────────────────────
+
+func runBatchModePostgresSink(
+	db *sql.DB,
+	cfg ConnectionConfig,
+	table string,
+	schemaMode string,
+	batchSize int,
+	batchSizeMin int,
+	batchSizeMax int,
+	numBatches int,
+	distribution string,
+	hotspotDays int,
+	sigCh chan os.Signal,
+) error {
+	// Use schema-qualified table name if schema is specified
+	fqt := cfg.getPostgresTableName(table)
+
+	if err := ensurePostgresSchema(db, cfg); err != nil {
+		return err
+	}
+
+	// Create table if it doesn't exist
+	ddl := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		id          INTEGER,
+		ts          TIMESTAMP,
+		event_type  VARCHAR
+	)`, fqt)
+	if schemaMode == "rich" {
+		ddl = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			id          INTEGER,
+			user_id     VARCHAR,
+			event_type  VARCHAR,
+			ts          TIMESTAMP,
+			payload     JSON,
+			metadata    JSON
+		)`, fqt)
+	}
+	if _, err := db.Exec(ddl); err != nil {
+		return fmt.Errorf("create table: %w", err)
+	}
+
+	// Get max existing ID
+	maxID := int64(0)
+	err := db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM " + fqt).Scan(&maxID)
+	if err != nil {
+		return fmt.Errorf("query max id: %w", err)
+	}
+	nextID := maxID + 1
+	fmt.Printf("  Starting ID   : %s%d%s (max existing: %s%d%s)\n",
+		green, nextID, reset, dim, maxID, reset)
+
+	sqlGen := batchSQLSimplePostgres
+	if schemaMode == "rich" {
+		sqlGen = batchSQLRichPostgres
+	}
+
+	var (
+		cumulative int64
+		startTotal = time.Now()
+		batchNum   int
+	)
+
+	runForever := numBatches == 0
+
+loop:
+	for runForever || batchNum < numBatches {
+		select {
+		case <-sigCh:
+			fmt.Printf("\n%sInterrupted by user.%s\n", yellow, reset)
+			break loop
+		default:
+		}
+
+		batchNum++
+		startID := nextID
+
+		// Use randomized batch size if min/max provided, otherwise use fixed batchSize
+		currentBatchSize := batchSize
+		if batchSizeMin > 0 || batchSizeMax > 0 {
+			min, max := batchSizeMin, batchSizeMax
+			if min <= 0 {
+				min = 1
+			}
+			if max <= 0 {
+				max = batchSize
+			}
+			if min > max {
+				min, max = max, min
+			}
+			currentBatchSize = min + rand.Intn(max-min+1)
+		}
+		nextID += int64(currentBatchSize)
+
+		query := sqlGen(fqt, int(startID), currentBatchSize, distribution, hotspotDays)
+		t0 := time.Now()
+		if _, err := db.Exec(query); err != nil {
+			return fmt.Errorf("batch %d insert: %w", batchNum, err)
+		}
+		batchSecs := time.Since(t0).Seconds()
+
+		cumulative += int64(currentBatchSize)
+
+		// Simple status per batch (no metrics)
+		fmt.Printf("  Batch %d: %s rows in %.3fs\n", batchNum, commas(int64(currentBatchSize)), batchSecs)
+	}
+
+	elapsedTotal := time.Since(startTotal).Seconds()
+	overall := 0.0
+	if elapsedTotal > 0 {
+		overall = float64(cumulative) / elapsedTotal
+	}
+	rule("")
+	fmt.Printf("%s%sDone.%s Inserted %s%s%s rows in %.2fs  (%s rows/sec overall)\n",
+		bold, green, reset,
+		bold, commas(cumulative), reset,
+		elapsedTotal,
+		commas(int64(overall)),
+	)
+	return nil
+}
+
+func runTickerModePostgresSink(
+	db *sql.DB,
+	cfg ConnectionConfig,
+	table string,
+	schemaMode string,
+	duration int,
+	duplicateRate float64,
+	schemaDriftRate float64,
+	sigCh chan os.Signal,
+) error {
+	// Use schema-qualified table name if schema is specified
+	fqt := cfg.getPostgresTableName(table)
+
+	if err := ensurePostgresSchema(db, cfg); err != nil {
+		return err
+	}
+
+	// Create table if it doesn't exist
+	ddl := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		id          INTEGER,
+		ts          TIMESTAMP,
+		event_type  VARCHAR
+	)`, fqt)
+	if schemaMode == "rich" {
+		ddl = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			id          INTEGER,
+			user_id     VARCHAR,
+			event_type  VARCHAR,
+			ts          TIMESTAMP,
+			payload     JSON,
+			metadata    JSON
+		)`, fqt)
+	}
+	if _, err := db.Exec(ddl); err != nil {
+		return fmt.Errorf("create table: %w", err)
+	}
+
+	// Get max existing ID
+	maxID := int64(0)
+	err := db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM " + fqt).Scan(&maxID)
+	if err != nil {
+		return fmt.Errorf("query max id: %w", err)
+	}
+	nextID := maxID + 1
+
+	var (
+		cumulative int64
+		dupCount   int64
+		driftCount int64
+		startTotal = time.Now()
+		tickNum    int
+	)
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	durationTimer := time.After(time.Duration(duration) * time.Second)
+
+loop:
+	for {
+		select {
+		case <-sigCh:
+			fmt.Printf("\n%sInterrupted by user.%s\n", yellow, reset)
+			break loop
+		case <-durationTimer:
+			fmt.Printf("\n%sDuration complete.%s\n", yellow, reset)
+			break loop
+		case <-ticker.C:
+			tickNum++
+			id := nextID
+			nextID++
+
+			var query string
+			if schemaMode == "rich" {
+				userID := streamUsers[rand.Intn(len(streamUsers))]
+				query = tickerSQLRichPostgres(fqt, int(id), userID)
+			} else {
+				query = tickerSQLSimplePostgres(fqt, int(id))
+			}
+
+			if _, err := db.Exec(query); err != nil {
+				return fmt.Errorf("tick %d insert: %w", tickNum, err)
+			}
+			cumulative++
+
+			// Inject a duplicate row with probability duplicateRate.
+			if duplicateRate > 0 && rand.Float64() < duplicateRate {
+				if _, err := db.Exec(query); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: duplicate inject failed at tick %d: %v\n", tickNum, err)
+				} else {
+					dupCount++
+					cumulative++
+				}
+			}
+
+			// Inject a schema-drift row with probability schemaDriftRate. The
+			// drifted insert names a column the table doesn't have, so Postgres
+			// rejects it — simulating a source system emitting a new field.
+			if schemaDriftRate > 0 && rand.Float64() < schemaDriftRate {
+				if _, err := db.Exec(tickerSQLDriftedPostgres(fqt, int(id), schemaMode)); err != nil {
+					driftCount++
+					fmt.Printf("\n%s⚠  Schema drift at tick %d:%s %v\n", red+bold, tickNum, reset, err)
+				}
+			}
+
+			elapsedTotal := time.Since(startTotal).Seconds()
+			if tickNum%10 == 0 {
+				fmt.Printf("  Tick %d: %s rows inserted so far in %.1fs\n", tickNum, commas(cumulative), elapsedTotal)
+			}
+		}
+	}
+
+	elapsedTotal := time.Since(startTotal).Seconds()
+	overall := 0.0
+	if elapsedTotal > 0 {
+		overall = float64(cumulative) / elapsedTotal
+	}
+	rule("")
+	fmt.Printf("%s%sDone.%s Inserted %s%s%s rows in %.2fs  (%s rows/sec overall)\n",
+		bold, green, reset,
+		bold, commas(cumulative), reset,
+		elapsedTotal,
+		commas(int64(overall)),
+	)
+	if dupCount > 0 {
+		fmt.Printf("%s  ↳ %s duplicate rows injected (duplicate rate %.0f%%)%s\n",
+			yellow, commas(dupCount), duplicateRate*100, reset)
+	}
+	if driftCount > 0 {
+		fmt.Printf("%s  ↳ %s schema drift errors (drift rate %.0f%%)%s\n",
+			red, commas(driftCount), schemaDriftRate*100, reset)
+	}
+	return nil
+}
+
 func main() {
 	var (
 		table              string
@@ -922,6 +1385,9 @@ If using a local Postgres metadata store, the database must already exist:
 			if setupConn.DucklakeSecret == "" && setupConn.MetadataStore != "postgres" && setupConn.MetadataStore != "duckdb" {
 				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", setupConn.MetadataStore)
 			}
+			if err := resolvePgDSN(cmd, &setupConn); err != nil {
+				return err
+			}
 			return runSetup(setupConn)
 		},
 	}
@@ -945,6 +1411,9 @@ Prompts for confirmation unless --force is set.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if resetConn.DucklakeSecret == "" && resetConn.MetadataStore != "postgres" && resetConn.MetadataStore != "duckdb" {
 				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", resetConn.MetadataStore)
+			}
+			if err := resolvePgDSN(cmd, &resetConn); err != nil {
+				return err
 			}
 			return runReset(resetConn, forceReset)
 		},
@@ -972,9 +1441,14 @@ Modes:
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if table == "" {
-				if schemaMode == "rich" {
+				switch {
+				case runConn.isPostgresSink() && schemaMode == "rich":
+					table = "events_rich_source"
+				case runConn.isPostgresSink():
+					table = "events_source"
+				case schemaMode == "rich":
 					table = "events_rich"
-				} else {
+				default:
 					table = "events"
 				}
 			}
@@ -996,11 +1470,21 @@ Modes:
 			if schemaDriftRate < 0 || schemaDriftRate > 1 {
 				return fmt.Errorf("--schema-drift-rate must be between 0.0 and 1.0, got %.2f", schemaDriftRate)
 			}
+			if err := resolvePgDSN(cmd, &runConn); err != nil {
+				return err
+			}
 
-			// ── banner ──────────────────────────────────────────────────────
+		// ── banner ──────────────────────────────────────────────────────
+		postgresSink := runConn.isPostgresSink()
+		if postgresSink {
+			rule("Postgres Source Data Load")
+			fmt.Printf("  Postgres DSN : %s%s%s\n", green, redactDSN(runConn.PgDSN), reset)
+			fmt.Printf("  Table        : %s%s%s\n", green, runConn.getPostgresTableName(table), reset)
+		} else {
 			rule("DuckLake Stream Benchmark")
 			printConnectionSummary(runConn)
 			fmt.Printf("  Table        : %s%s.%s%s\n", green, runConn.CatalogName, table, reset)
+		}
 			fmt.Printf("  Schema mode  : %s%s%s\n", green, schemaMode, reset)
 			fmt.Printf("  Run mode     : %s%s%s\n", green, runMode, reset)
 			fmt.Printf("  Distribution : %s%s%s\n", green, distribution, reset)
@@ -1009,23 +1493,46 @@ Modes:
 			}
 
 			if runMode == "batch" {
-				fmt.Printf("  Batch size   : %s%s%s rows\n", green, commas(int64(batchSize)), reset)
+				// Report the randomized range when it's in effect, since the
+				// fixed --batch-size is ignored in that case.
+				if batchSizeMin > 0 || batchSizeMax > 0 {
+					lo, hi := batchSizeMin, batchSizeMax
+					if lo <= 0 {
+						lo = 1
+					}
+					if hi <= 0 {
+						hi = batchSize
+					}
+					if lo > hi {
+						lo, hi = hi, lo
+					}
+					fmt.Printf("  Batch size   : %s%s–%s%s rows (random per batch)\n",
+						green, commas(int64(lo)), commas(int64(hi)), reset)
+				} else {
+					fmt.Printf("  Batch size   : %s%s%s rows\n", green, commas(int64(batchSize)), reset)
+				}
 				if numBatches == 0 {
 					fmt.Printf("  Batches      : %s∞%s\n", green, reset)
 				} else {
 					fmt.Printf("  Batches      : %s%d%s\n", green, numBatches, reset)
 				}
-				if checkpointInterval == 0 {
-					fmt.Printf("  Flush        : %sdisabled%s\n", green, reset)
-				} else {
-					fmt.Printf("  Flush        : every %s%d%s batches\n", green, checkpointInterval, reset)
+				// Flushing is a DuckLake inlining concern; it has no meaning
+				// when writing straight to Postgres.
+				if !postgresSink {
+					if checkpointInterval == 0 {
+						fmt.Printf("  Flush        : %sdisabled%s\n", green, reset)
+					} else {
+						fmt.Printf("  Flush        : every %s%d%s batches\n", green, checkpointInterval, reset)
+					}
 				}
 			} else if runMode == "ticker" {
 				fmt.Printf("  Duration     : %s%d%s seconds\n", green, duration, reset)
-				if checkpointInterval == 0 {
-					fmt.Printf("  Flush        : %sdisabled%s (no flush at end)\n", green, reset)
-				} else {
-					fmt.Printf("  Flush        : at end if inlined rows > %s%d%s\n", green, checkpointInterval, reset)
+				if !postgresSink {
+					if checkpointInterval == 0 {
+						fmt.Printf("  Flush        : %sdisabled%s (no flush at end)\n", green, reset)
+					} else {
+						fmt.Printf("  Flush        : at end if inlined rows > %s%d%s\n", green, checkpointInterval, reset)
+					}
 				}
 				if duplicateRate > 0 {
 					fmt.Printf("  Duplicate rate : %s%.0f%%%s duplicate rows\n", yellow, duplicateRate*100, reset)
@@ -1038,20 +1545,32 @@ Modes:
 					fmt.Printf("  Schema drift : %sdisabled%s\n", green, reset)
 				}
 			}
-			fmt.Println()
+		fmt.Println()
 
-			// ── open connection ─────────────────────────────────────────────
-			db, err := openAndAttach(runConn)
-			if err != nil {
-				return err
-			}
-			defer db.Close()
+		// ── open connection ─────────────────────────────────────────────
+		var db *sql.DB
+		var err error
+		if runConn.isPostgresSink() {
+			db, err = openPostgres(runConn)
+		} else {
+			db, err = openAndAttach(runConn)
+		}
+		if err != nil {
+			return err
+		}
+		defer db.Close()
 
-			// ── signal handling ─────────────────────────────────────────────
-			sigCh := make(chan os.Signal, 1)
-			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		// ── signal handling ─────────────────────────────────────────────
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 		// ── run selected mode ───────────────────────────────────────────
+		if runConn.isPostgresSink() {
+			if runMode == "ticker" {
+				return runTickerModePostgresSink(db, runConn, table, schemaMode, duration, duplicateRate, schemaDriftRate, sigCh)
+			}
+			return runBatchModePostgresSink(db, runConn, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, distribution, hotspotDays, sigCh)
+		}
 		if runMode == "ticker" {
 			return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, sigCh)
 		}
