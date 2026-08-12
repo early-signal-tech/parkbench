@@ -26,6 +26,7 @@ import (
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+	_ "github.com/lib/pq"
 	"github.com/spf13/cobra"
 )
 
@@ -563,6 +564,10 @@ func recordRejectedEvent(
 // ── run loops ──────────────────────────────────────────────────────────────
 
 func runSetup(cfg ConnectionConfig) error {
+	if cfg.isPostgresSink() {
+		return runSetupPostgresSink(cfg)
+	}
+
 	db, err := openAndAttach(cfg)
 	if err != nil {
 		return err
@@ -589,6 +594,42 @@ func runSetup(cfg ConnectionConfig) error {
 		green, cfg.CatalogName, cfg.CatalogName, cfg.CatalogName, rejectedEventsTable, reset)
 	fmt.Println()
 	fmt.Printf("%s✓ Setup complete. Ready for benchmarking!%s\n", green, reset)
+	return nil
+}
+
+func runSetupPostgresSink(cfg ConnectionConfig) error {
+	db, err := openPostgres(cfg)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	// Create source tables for both simple and rich schemas
+	simpleDDL := `CREATE TABLE IF NOT EXISTS events_source (
+		id          INTEGER,
+		ts          TIMESTAMP,
+		event_type  VARCHAR
+	)`
+	if _, err := db.Exec(simpleDDL); err != nil {
+		return fmt.Errorf("create events_source table: %w", err)
+	}
+
+	richDDL := `CREATE TABLE IF NOT EXISTS events_rich_source (
+		id          INTEGER,
+		user_id     VARCHAR,
+		event_type  VARCHAR,
+		ts          TIMESTAMP,
+		payload     JSON,
+		metadata    JSON
+	)`
+	if _, err := db.Exec(richDDL); err != nil {
+		return fmt.Errorf("create events_rich_source table: %w", err)
+	}
+
+	rule("Postgres Source Setup Complete")
+	fmt.Printf("  Tables       : %sevents_source, events_rich_source%s\n", green, reset)
+	fmt.Println()
+	fmt.Printf("%s✓ Setup complete. Ready for data loading!%s\n", green, reset)
 	return nil
 }
 
@@ -876,6 +917,226 @@ loop:
 	return nil
 }
 
+// ── postgres sink modes (simplified, no metrics) ────────────────────────────
+
+func runBatchModePostgresSink(
+	db *sql.DB,
+	table string,
+	schemaMode string,
+	batchSize int,
+	batchSizeMin int,
+	batchSizeMax int,
+	numBatches int,
+	distribution string,
+	hotspotDays int,
+	sigCh chan os.Signal,
+) error {
+	// Create table if it doesn't exist
+	ddl := `CREATE TABLE IF NOT EXISTS ` + table + ` (
+		id          INTEGER,
+		ts          TIMESTAMP,
+		event_type  VARCHAR
+	)`
+	if schemaMode == "rich" {
+		ddl = `CREATE TABLE IF NOT EXISTS ` + table + ` (
+			id          INTEGER,
+			user_id     VARCHAR,
+			event_type  VARCHAR,
+			ts          TIMESTAMP,
+			payload     JSON,
+			metadata    JSON
+		)`
+	}
+	if _, err := db.Exec(ddl); err != nil {
+		return fmt.Errorf("create table: %w", err)
+	}
+
+	// Get max existing ID
+	maxID := int64(0)
+	err := db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM " + table).Scan(&maxID)
+	if err != nil {
+		return fmt.Errorf("query max id: %w", err)
+	}
+	nextID := maxID + 1
+	fmt.Printf("  Starting ID   : %s%d%s (max existing: %s%d%s)\n",
+		green, nextID, reset, dim, maxID, reset)
+
+	sqlGen := batchSQLSimple
+	if schemaMode == "rich" {
+		sqlGen = batchSQLRich
+	}
+
+	var (
+		cumulative int64
+		startTotal = time.Now()
+		batchNum   int
+	)
+
+	runForever := numBatches == 0
+
+loop:
+	for runForever || batchNum < numBatches {
+		select {
+		case <-sigCh:
+			fmt.Printf("\n%sInterrupted by user.%s\n", yellow, reset)
+			break loop
+		default:
+		}
+
+		batchNum++
+		startID := nextID
+
+		// Use randomized batch size if min/max provided, otherwise use fixed batchSize
+		currentBatchSize := batchSize
+		if batchSizeMin > 0 || batchSizeMax > 0 {
+			min, max := batchSizeMin, batchSizeMax
+			if min <= 0 {
+				min = 1
+			}
+			if max <= 0 {
+				max = batchSize
+			}
+			if min > max {
+				min, max = max, min
+			}
+			currentBatchSize = min + rand.Intn(max-min+1)
+		}
+		nextID += int64(currentBatchSize)
+
+		query := sqlGen(table, int(startID), currentBatchSize, distribution, hotspotDays)
+		t0 := time.Now()
+		if _, err := db.Exec(query); err != nil {
+			return fmt.Errorf("batch %d insert: %w", batchNum, err)
+		}
+		batchSecs := time.Since(t0).Seconds()
+
+		cumulative += int64(currentBatchSize)
+
+		// Simple status per batch (no metrics)
+		fmt.Printf("  Batch %d: %s rows in %.3fs\n", batchNum, commas(int64(currentBatchSize)), batchSecs)
+	}
+
+	elapsedTotal := time.Since(startTotal).Seconds()
+	overall := 0.0
+	if elapsedTotal > 0 {
+		overall = float64(cumulative) / elapsedTotal
+	}
+	rule("")
+	fmt.Printf("%s%sDone.%s Inserted %s%s%s rows in %.2fs  (%s rows/sec overall)\n",
+		bold, green, reset,
+		bold, commas(cumulative), reset,
+		elapsedTotal,
+		commas(int64(overall)),
+	)
+	return nil
+}
+
+func runTickerModePostgresSink(
+	db *sql.DB,
+	table string,
+	schemaMode string,
+	duration int,
+	duplicateRate float64,
+	schemaDriftRate float64,
+	sigCh chan os.Signal,
+) error {
+	// Create table if it doesn't exist
+	ddl := `CREATE TABLE IF NOT EXISTS ` + table + ` (
+		id          INTEGER,
+		ts          TIMESTAMP,
+		event_type  VARCHAR
+	)`
+	if schemaMode == "rich" {
+		ddl = `CREATE TABLE IF NOT EXISTS ` + table + ` (
+			id          INTEGER,
+			user_id     VARCHAR,
+			event_type  VARCHAR,
+			ts          TIMESTAMP,
+			payload     JSON,
+			metadata    JSON
+		)`
+	}
+	if _, err := db.Exec(ddl); err != nil {
+		return fmt.Errorf("create table: %w", err)
+	}
+
+	// Get max existing ID
+	maxID := int64(0)
+	err := db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM " + table).Scan(&maxID)
+	if err != nil {
+		return fmt.Errorf("query max id: %w", err)
+	}
+	nextID := maxID + 1
+
+	var (
+		cumulative int64
+		startTotal = time.Now()
+		tickNum    int
+	)
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	durationTimer := time.After(time.Duration(duration) * time.Second)
+
+loop:
+	for {
+		select {
+		case <-sigCh:
+			fmt.Printf("\n%sInterrupted by user.%s\n", yellow, reset)
+			break loop
+		case <-durationTimer:
+			fmt.Printf("\n%sDuration complete.%s\n", yellow, reset)
+			break loop
+		case <-ticker.C:
+			tickNum++
+			id := nextID
+			nextID++
+
+			var query string
+			if schemaMode == "rich" {
+				userID := streamUsers[rand.Intn(len(streamUsers))]
+				query = tickerSQLRich(table, int(id), userID)
+			} else {
+				query = tickerSQLSimple(table, int(id))
+			}
+
+			if _, err := db.Exec(query); err != nil {
+				return fmt.Errorf("tick %d insert: %w", tickNum, err)
+			}
+			cumulative++
+
+			// Inject a duplicate row with probability duplicateRate.
+			if duplicateRate > 0 && rand.Float64() < duplicateRate {
+				if _, err := db.Exec(query); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: duplicate inject failed at tick %d: %v\n", tickNum, err)
+				} else {
+					cumulative++
+				}
+			}
+
+			elapsedTotal := time.Since(startTotal).Seconds()
+			if tickNum%10 == 0 {
+				fmt.Printf("  Tick %d: %s rows inserted so far in %.1fs\n", tickNum, commas(cumulative), elapsedTotal)
+			}
+		}
+	}
+
+	elapsedTotal := time.Since(startTotal).Seconds()
+	overall := 0.0
+	if elapsedTotal > 0 {
+		overall = float64(cumulative) / elapsedTotal
+	}
+	rule("")
+	fmt.Printf("%s%sDone.%s Inserted %s%s%s rows in %.2fs  (%s rows/sec overall)\n",
+		bold, green, reset,
+		bold, commas(cumulative), reset,
+		elapsedTotal,
+		commas(int64(overall)),
+	)
+	return nil
+}
+
 func main() {
 	var (
 		table              string
@@ -997,10 +1258,18 @@ Modes:
 				return fmt.Errorf("--schema-drift-rate must be between 0.0 and 1.0, got %.2f", schemaDriftRate)
 			}
 
-			// ── banner ──────────────────────────────────────────────────────
+		// ── banner ──────────────────────────────────────────────────────
+		if runConn.isPostgresSink() {
+			rule("Postgres Source Data Load")
+		} else {
 			rule("DuckLake Stream Benchmark")
-			printConnectionSummary(runConn)
+		}
+		printConnectionSummary(runConn)
+		if runConn.isPostgresSink() {
+			fmt.Printf("  Table        : %s%s%s\n", green, table, reset)
+		} else {
 			fmt.Printf("  Table        : %s%s.%s%s\n", green, runConn.CatalogName, table, reset)
+		}
 			fmt.Printf("  Schema mode  : %s%s%s\n", green, schemaMode, reset)
 			fmt.Printf("  Run mode     : %s%s%s\n", green, runMode, reset)
 			fmt.Printf("  Distribution : %s%s%s\n", green, distribution, reset)
@@ -1038,20 +1307,32 @@ Modes:
 					fmt.Printf("  Schema drift : %sdisabled%s\n", green, reset)
 				}
 			}
-			fmt.Println()
+		fmt.Println()
 
-			// ── open connection ─────────────────────────────────────────────
-			db, err := openAndAttach(runConn)
-			if err != nil {
-				return err
-			}
-			defer db.Close()
+		// ── open connection ─────────────────────────────────────────────
+		var db *sql.DB
+		var err error
+		if runConn.isPostgresSink() {
+			db, err = openPostgres(runConn)
+		} else {
+			db, err = openAndAttach(runConn)
+		}
+		if err != nil {
+			return err
+		}
+		defer db.Close()
 
-			// ── signal handling ─────────────────────────────────────────────
-			sigCh := make(chan os.Signal, 1)
-			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		// ── signal handling ─────────────────────────────────────────────
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 		// ── run selected mode ───────────────────────────────────────────
+		if runConn.isPostgresSink() {
+			if runMode == "ticker" {
+				return runTickerModePostgresSink(db, table, schemaMode, duration, duplicateRate, schemaDriftRate, sigCh)
+			}
+			return runBatchModePostgresSink(db, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, distribution, hotspotDays, sigCh)
+		}
 		if runMode == "ticker" {
 			return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, sigCh)
 		}

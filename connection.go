@@ -28,6 +28,11 @@ import (
 type ConnectionConfig struct {
 	CatalogName string
 
+	// DataSink: write target for run/setup operations.
+	// "ducklake" (default) writes through DuckLake catalog.
+	// "postgres" writes directly to a Postgres table (for ELT source data demos).
+	DataSink string
+
 	// Named persistent secret mode.
 	DucklakeSecret string
 
@@ -50,6 +55,10 @@ type ConnectionConfig struct {
 	S3KeyID     string
 	S3SecretKey string
 	S3Region    string
+}
+
+func (c ConnectionConfig) isPostgresSink() bool {
+	return c.DataSink == "postgres"
 }
 
 func (c ConnectionConfig) isS3() bool {
@@ -220,9 +229,28 @@ func openAndAttach(c ConnectionConfig) (*sql.DB, error) {
 	return db, nil
 }
 
+// openPostgres opens a direct connection to Postgres (for postgres sink mode).
+// It does not attach DuckLake — it's a plain Postgres connection for direct writes.
+func openPostgres(c ConnectionConfig) (*sql.DB, error) {
+	dsn := c.PgDSN
+	if dsn == "" {
+		dsn = "dbname=postgres host=localhost"
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open postgres: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping postgres: %w", err)
+	}
+	return db, nil
+}
+
 // registerConnectionFlags wires the shared connection flags onto a cobra
 // command, binding them into cfg.
 func registerConnectionFlags(cmd *cobra.Command, cfg *ConnectionConfig) {
+	cmd.Flags().StringVar(&cfg.DataSink, "data-sink", "ducklake", "Write target: 'ducklake' (default) writes through DuckLake; 'postgres' writes directly to a Postgres table (for ELT source data)")
 	cmd.Flags().StringVarP(&cfg.CatalogName, "catalog", "c", "wh", "Catalog alias used inside DuckDB")
 	cmd.Flags().StringVar(&cfg.DucklakeSecret, "ducklake-secret", "", "Name of a pre-created persistent DUCKLAKE secret (see 'parkbench secrets create-ducklake'); when set, all other connection flags below are ignored")
 	cmd.Flags().StringVar(&cfg.MetadataCatalogName, "metadata-catalog-name", "", "Expose DuckLake's metadata tables under this name in DuckDB (METADATA_CATALOG); omit to keep them hidden")
