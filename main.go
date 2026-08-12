@@ -604,30 +604,40 @@ func runSetupPostgresSink(cfg ConnectionConfig) error {
 	}
 	defer db.Close()
 
+	// Create schema if it doesn't exist (and is specified)
+	if cfg.PostgresSchema != "" {
+		createSchemaDDL := fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", cfg.PostgresSchema)
+		if _, err := db.Exec(createSchemaDDL); err != nil {
+			return fmt.Errorf("create schema: %w", err)
+		}
+	}
+
 	// Create source tables for both simple and rich schemas
-	simpleDDL := `CREATE TABLE IF NOT EXISTS events_source (
+	simpleTable := cfg.getPostgresTableName("events_source")
+	simpleDDL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 		id          INTEGER,
 		ts          TIMESTAMP,
 		event_type  VARCHAR
-	)`
+	)`, simpleTable)
 	if _, err := db.Exec(simpleDDL); err != nil {
-		return fmt.Errorf("create events_source table: %w", err)
+		return fmt.Errorf("create %s table: %w", simpleTable, err)
 	}
 
-	richDDL := `CREATE TABLE IF NOT EXISTS events_rich_source (
+	richTable := cfg.getPostgresTableName("events_rich_source")
+	richDDL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 		id          INTEGER,
 		user_id     VARCHAR,
 		event_type  VARCHAR,
 		ts          TIMESTAMP,
 		payload     JSON,
 		metadata    JSON
-	)`
+	)`, richTable)
 	if _, err := db.Exec(richDDL); err != nil {
-		return fmt.Errorf("create events_rich_source table: %w", err)
+		return fmt.Errorf("create %s table: %w", richTable, err)
 	}
 
 	rule("Postgres Source Setup Complete")
-	fmt.Printf("  Tables       : %sevents_source, events_rich_source%s\n", green, reset)
+	fmt.Printf("  Tables       : %s%s, %s%s\n", green, simpleTable, richTable, reset)
 	fmt.Println()
 	fmt.Printf("%s✓ Setup complete. Ready for data loading!%s\n", green, reset)
 	return nil
@@ -921,6 +931,7 @@ loop:
 
 func runBatchModePostgresSink(
 	db *sql.DB,
+	cfg ConnectionConfig,
 	table string,
 	schemaMode string,
 	batchSize int,
@@ -931,21 +942,24 @@ func runBatchModePostgresSink(
 	hotspotDays int,
 	sigCh chan os.Signal,
 ) error {
+	// Use schema-qualified table name if schema is specified
+	fqt := cfg.getPostgresTableName(table)
+
 	// Create table if it doesn't exist
-	ddl := `CREATE TABLE IF NOT EXISTS ` + table + ` (
+	ddl := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 		id          INTEGER,
 		ts          TIMESTAMP,
 		event_type  VARCHAR
-	)`
+	)`, fqt)
 	if schemaMode == "rich" {
-		ddl = `CREATE TABLE IF NOT EXISTS ` + table + ` (
+		ddl = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			id          INTEGER,
 			user_id     VARCHAR,
 			event_type  VARCHAR,
 			ts          TIMESTAMP,
 			payload     JSON,
 			metadata    JSON
-		)`
+		)`, fqt)
 	}
 	if _, err := db.Exec(ddl); err != nil {
 		return fmt.Errorf("create table: %w", err)
@@ -953,7 +967,7 @@ func runBatchModePostgresSink(
 
 	// Get max existing ID
 	maxID := int64(0)
-	err := db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM " + table).Scan(&maxID)
+	err := db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM " + fqt).Scan(&maxID)
 	if err != nil {
 		return fmt.Errorf("query max id: %w", err)
 	}
@@ -1003,7 +1017,7 @@ loop:
 		}
 		nextID += int64(currentBatchSize)
 
-		query := sqlGen(table, int(startID), currentBatchSize, distribution, hotspotDays)
+		query := sqlGen(fqt, int(startID), currentBatchSize, distribution, hotspotDays)
 		t0 := time.Now()
 		if _, err := db.Exec(query); err != nil {
 			return fmt.Errorf("batch %d insert: %w", batchNum, err)
@@ -1033,6 +1047,7 @@ loop:
 
 func runTickerModePostgresSink(
 	db *sql.DB,
+	cfg ConnectionConfig,
 	table string,
 	schemaMode string,
 	duration int,
@@ -1040,21 +1055,24 @@ func runTickerModePostgresSink(
 	schemaDriftRate float64,
 	sigCh chan os.Signal,
 ) error {
+	// Use schema-qualified table name if schema is specified
+	fqt := cfg.getPostgresTableName(table)
+
 	// Create table if it doesn't exist
-	ddl := `CREATE TABLE IF NOT EXISTS ` + table + ` (
+	ddl := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 		id          INTEGER,
 		ts          TIMESTAMP,
 		event_type  VARCHAR
-	)`
+	)`, fqt)
 	if schemaMode == "rich" {
-		ddl = `CREATE TABLE IF NOT EXISTS ` + table + ` (
+		ddl = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			id          INTEGER,
 			user_id     VARCHAR,
 			event_type  VARCHAR,
 			ts          TIMESTAMP,
 			payload     JSON,
 			metadata    JSON
-		)`
+		)`, fqt)
 	}
 	if _, err := db.Exec(ddl); err != nil {
 		return fmt.Errorf("create table: %w", err)
@@ -1062,7 +1080,7 @@ func runTickerModePostgresSink(
 
 	// Get max existing ID
 	maxID := int64(0)
-	err := db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM " + table).Scan(&maxID)
+	err := db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM " + fqt).Scan(&maxID)
 	if err != nil {
 		return fmt.Errorf("query max id: %w", err)
 	}
@@ -1093,13 +1111,13 @@ loop:
 			id := nextID
 			nextID++
 
-			var query string
-			if schemaMode == "rich" {
-				userID := streamUsers[rand.Intn(len(streamUsers))]
-				query = tickerSQLRich(table, int(id), userID)
-			} else {
-				query = tickerSQLSimple(table, int(id))
-			}
+		var query string
+		if schemaMode == "rich" {
+			userID := streamUsers[rand.Intn(len(streamUsers))]
+			query = tickerSQLRich(fqt, int(id), userID)
+		} else {
+			query = tickerSQLSimple(fqt, int(id))
+		}
 
 			if _, err := db.Exec(query); err != nil {
 				return fmt.Errorf("tick %d insert: %w", tickNum, err)
@@ -1329,9 +1347,9 @@ Modes:
 		// ── run selected mode ───────────────────────────────────────────
 		if runConn.isPostgresSink() {
 			if runMode == "ticker" {
-				return runTickerModePostgresSink(db, table, schemaMode, duration, duplicateRate, schemaDriftRate, sigCh)
+				return runTickerModePostgresSink(db, runConn, table, schemaMode, duration, duplicateRate, schemaDriftRate, sigCh)
 			}
-			return runBatchModePostgresSink(db, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, distribution, hotspotDays, sigCh)
+			return runBatchModePostgresSink(db, runConn, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, distribution, hotspotDays, sigCh)
 		}
 		if runMode == "ticker" {
 			return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, sigCh)

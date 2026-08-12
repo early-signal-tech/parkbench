@@ -33,6 +33,10 @@ type ConnectionConfig struct {
 	// "postgres" writes directly to a Postgres table (for ELT source data demos).
 	DataSink string
 
+	// PostgresSchema: schema name for postgres sink tables (postgres sink mode only).
+	// If empty, uses the default Postgres schema (usually 'public').
+	PostgresSchema string
+
 	// Named persistent secret mode.
 	DucklakeSecret string
 
@@ -59,6 +63,15 @@ type ConnectionConfig struct {
 
 func (c ConnectionConfig) isPostgresSink() bool {
 	return c.DataSink == "postgres"
+}
+
+// getPostgresTableName returns the schema-qualified table name for postgres sink.
+// If PostgresSchema is set, returns "schema.table", otherwise just "table".
+func (c ConnectionConfig) getPostgresTableName(table string) string {
+	if c.PostgresSchema != "" {
+		return c.PostgresSchema + "." + table
+	}
+	return table
 }
 
 func (c ConnectionConfig) isS3() bool {
@@ -251,6 +264,7 @@ func openPostgres(c ConnectionConfig) (*sql.DB, error) {
 // command, binding them into cfg.
 func registerConnectionFlags(cmd *cobra.Command, cfg *ConnectionConfig) {
 	cmd.Flags().StringVar(&cfg.DataSink, "data-sink", "ducklake", "Write target: 'ducklake' (default) writes through DuckLake; 'postgres' writes directly to a Postgres table (for ELT source data)")
+	cmd.Flags().StringVar(&cfg.PostgresSchema, "postgres-schema", "", "Postgres schema for source tables when using --data-sink postgres (defaults to 'public' if unset)")
 	cmd.Flags().StringVarP(&cfg.CatalogName, "catalog", "c", "wh", "Catalog alias used inside DuckDB")
 	cmd.Flags().StringVar(&cfg.DucklakeSecret, "ducklake-secret", "", "Name of a pre-created persistent DUCKLAKE secret (see 'parkbench secrets create-ducklake'); when set, all other connection flags below are ignored")
 	cmd.Flags().StringVar(&cfg.MetadataCatalogName, "metadata-catalog-name", "", "Expose DuckLake's metadata tables under this name in DuckDB (METADATA_CATALOG); omit to keep them hidden")
