@@ -200,6 +200,91 @@ func batchSQLRich(fqt string, startID, batchSize int, distribution string, hotsp
 	)
 }
 
+// ── Postgres-specific batch SQL (uses standard SQL, no DuckDB extensions) ────
+
+func batchSQLSimplePostgres(fqt string, startID, batchSize int, distribution string, hotspotDays int) string {
+	var tsExpr string
+	if distribution == "hotspot" {
+		// 70% in last 6 hours, 30% spread across past N days
+		oldestSeconds := hotspotDays * 24 * 3600
+		tsExpr = fmt.Sprintf(`CASE
+			WHEN random() < 0.7 THEN now() - (random() * 21600)::text || ' seconds'::interval
+			ELSE now() - ((21600 + random() * %d)::int)::text || ' seconds'::interval
+		END`, oldestSeconds-21600)
+	} else if distribution == "yesterday" {
+		// timestamps only for the previous day
+		tsExpr = "CURRENT_DATE - 1 + (random() * 86400)::text || ' seconds'::interval"
+	} else if distribution == "last_week" {
+		// timestamps for the past 7 days
+		tsExpr = "now() - (random() * 604800)::text || ' seconds'::interval"
+	} else {
+		// default: uniform across past 24 hours
+		tsExpr = "now() - (random() * 86400)::text || ' seconds'::interval"
+	}
+
+	// Generate VALUES clause for Postgres
+	return fmt.Sprintf(`
+		INSERT INTO %s (id, ts, event_type)
+		SELECT
+			row_number() OVER () + %d AS id,
+			%s AS ts,
+			(ARRAY%v)[((random() * %d)::int %% %d) + 1] AS event_type
+		FROM generate_series(1, %d)`,
+		fqt, startID,
+		tsExpr,
+		eventTypes, len(eventTypes), len(eventTypes),
+		batchSize,
+	)
+}
+
+func batchSQLRichPostgres(fqt string, startID, batchSize int, distribution string, hotspotDays int) string {
+	var tsExpr string
+	if distribution == "hotspot" {
+		oldestSeconds := hotspotDays * 24 * 3600
+		tsExpr = fmt.Sprintf(`CASE
+			WHEN random() < 0.7 THEN now() - (random() * 21600)::text || ' seconds'::interval
+			ELSE now() - ((21600 + random() * %d)::int)::text || ' seconds'::interval
+		END`, oldestSeconds-21600)
+	} else if distribution == "yesterday" {
+		tsExpr = "CURRENT_DATE - 1 + (random() * 86400)::text || ' seconds'::interval"
+	} else if distribution == "last_week" {
+		tsExpr = "now() - (random() * 604800)::text || ' seconds'::interval"
+	} else {
+		tsExpr = "now() - (random() * 86400)::text || ' seconds'::interval"
+	}
+
+	// Build JSON payload inline
+	payloadExpr := fmt.Sprintf(`jsonb_build_object(
+		'event_type', (ARRAY%v)[((random() * %d)::int %% %d) + 1],
+		'page', (ARRAY%v)[((random() * %d)::int %% %d) + 1],
+		'source', (ARRAY%v)[((random() * %d)::int %% %d) + 1],
+		'country', (ARRAY%v)[((random() * %d)::int %% %d) + 1]
+	)`,
+		eventTypes, len(eventTypes), len(eventTypes),
+		pages, len(pages), len(pages),
+		sources, len(sources), len(sources),
+		countries, len(countries), len(countries),
+	)
+
+	return fmt.Sprintf(`
+		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata)
+		SELECT
+			row_number() OVER () + %d AS id,
+			(ARRAY%v)[((random() * %d)::int %% %d) + 1] AS user_id,
+			(ARRAY%v)[((random() * %d)::int %% %d) + 1] AS event_type,
+			%s AS ts,
+			%s AS payload,
+			jsonb_build_object('timestamp', now()) AS metadata
+		FROM generate_series(1, %d)`,
+		fqt, startID,
+		streamUsers, len(streamUsers), len(streamUsers),
+		eventTypes, len(eventTypes), len(eventTypes),
+		tsExpr,
+		payloadExpr,
+		batchSize,
+	)
+}
+
 // ── Single-row SQL generation (for ticker mode) ────────────────────────────
 
 // tickerSQLSimpleDrifted inserts a row with a new column (event_category) that
@@ -975,9 +1060,9 @@ func runBatchModePostgresSink(
 	fmt.Printf("  Starting ID   : %s%d%s (max existing: %s%d%s)\n",
 		green, nextID, reset, dim, maxID, reset)
 
-	sqlGen := batchSQLSimple
+	sqlGen := batchSQLSimplePostgres
 	if schemaMode == "rich" {
-		sqlGen = batchSQLRich
+		sqlGen = batchSQLRichPostgres
 	}
 
 	var (
