@@ -3,9 +3,12 @@ package main
 import (
 	"database/sql"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "github.com/lib/pq"
+	"github.com/spf13/cobra"
 )
 
 // TestPostgresBatchSQL executes the generated postgres-sink SQL against a real
@@ -23,7 +26,11 @@ func TestPostgresBatchSQL(t *testing.T) {
 	}
 	defer db.Close()
 
-	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS parkbench_test"); err != nil {
+	// Drop first so an interrupted earlier run can't fail this one.
+	if _, err := db.Exec("DROP SCHEMA IF EXISTS parkbench_test CASCADE"); err != nil {
+		t.Fatalf("drop stale schema: %v", err)
+	}
+	if _, err := db.Exec("CREATE SCHEMA parkbench_test"); err != nil {
 		t.Fatalf("create schema: %v", err)
 	}
 	t.Cleanup(func() {
@@ -108,7 +115,11 @@ func TestPostgresTickerSQL(t *testing.T) {
 	}
 	defer db.Close()
 
-	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS parkbench_tick_test"); err != nil {
+	// Drop first so an interrupted earlier run can't fail this one.
+	if _, err := db.Exec("DROP SCHEMA IF EXISTS parkbench_tick_test CASCADE"); err != nil {
+		t.Fatalf("drop stale schema: %v", err)
+	}
+	if _, err := db.Exec("CREATE SCHEMA parkbench_tick_test"); err != nil {
 		t.Fatalf("create schema: %v", err)
 	}
 	t.Cleanup(func() {
@@ -158,6 +169,138 @@ func TestPostgresTickerSQL(t *testing.T) {
 		t.Run("drift/"+tc.mode, func(t *testing.T) {
 			if _, err := db.Exec(tickerSQLDriftedPostgres(tc.table, 99, tc.mode)); err == nil {
 				t.Error("drifted insert succeeded; expected an unknown-column error")
+			}
+		})
+	}
+}
+
+func TestResolvePgDSN(t *testing.T) {
+	newCmd := func(cfg *ConnectionConfig) *cobra.Command {
+		cmd := &cobra.Command{Use: "test", RunE: func(*cobra.Command, []string) error { return nil }}
+		registerConnectionFlags(cmd, cfg)
+		return cmd
+	}
+
+	writeFile := func(t *testing.T, contents string, mode os.FileMode) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "dsn")
+		if err := os.WriteFile(path, []byte(contents), mode); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		return path
+	}
+
+	t.Run("reads single line", func(t *testing.T) {
+		path := writeFile(t, "dbname=mydb host=localhost\n", 0o600)
+		var cfg ConnectionConfig
+		cmd := newCmd(&cfg)
+		if err := cmd.ParseFlags([]string{"--pg-dsn-file", path}); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if err := resolvePgDSN(cmd, &cfg); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if want := "dbname=mydb host=localhost"; cfg.PgDSN != want {
+			t.Errorf("PgDSN = %q, want %q", cfg.PgDSN, want)
+		}
+	})
+
+	t.Run("joins lines and skips comments", func(t *testing.T) {
+		path := writeFile(t, "# prod\nhost=db.example.com\n\nport=5432\ndbname=postgres\n", 0o600)
+		var cfg ConnectionConfig
+		cmd := newCmd(&cfg)
+		if err := cmd.ParseFlags([]string{"--pg-dsn-file", path}); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if err := resolvePgDSN(cmd, &cfg); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if want := "host=db.example.com port=5432 dbname=postgres"; cfg.PgDSN != want {
+			t.Errorf("PgDSN = %q, want %q", cfg.PgDSN, want)
+		}
+	})
+
+	t.Run("rejects combining with --pg-dsn", func(t *testing.T) {
+		path := writeFile(t, "dbname=mydb\n", 0o600)
+		var cfg ConnectionConfig
+		cmd := newCmd(&cfg)
+		if err := cmd.ParseFlags([]string{"--pg-dsn-file", path, "--pg-dsn", "dbname=other"}); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if err := resolvePgDSN(cmd, &cfg); err == nil {
+			t.Error("expected an error when both flags are set")
+		}
+	})
+
+	t.Run("errors on empty file", func(t *testing.T) {
+		path := writeFile(t, "# only a comment\n\n", 0o600)
+		var cfg ConnectionConfig
+		cmd := newCmd(&cfg)
+		if err := cmd.ParseFlags([]string{"--pg-dsn-file", path}); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if err := resolvePgDSN(cmd, &cfg); err == nil {
+			t.Error("expected an error for a file with no connection string")
+		}
+	})
+
+	t.Run("errors on missing file", func(t *testing.T) {
+		var cfg ConnectionConfig
+		cmd := newCmd(&cfg)
+		if err := cmd.ParseFlags([]string{"--pg-dsn-file", "/nonexistent/dsn"}); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if err := resolvePgDSN(cmd, &cfg); err == nil {
+			t.Error("expected an error for a missing file")
+		}
+	})
+
+	t.Run("leaves default untouched when unset", func(t *testing.T) {
+		var cfg ConnectionConfig
+		cmd := newCmd(&cfg)
+		if err := cmd.ParseFlags(nil); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if err := resolvePgDSN(cmd, &cfg); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if want := "dbname=ducklake_v1 host=localhost"; cfg.PgDSN != want {
+			t.Errorf("PgDSN = %q, want default %q", cfg.PgDSN, want)
+		}
+	})
+}
+
+func TestRedactDSN(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{
+			"keyword form",
+			"host=db.example.com dbname=postgres user=postgres password=s3cret sslmode=require",
+			"host=db.example.com dbname=postgres user=postgres password=*** sslmode=require",
+		},
+		{
+			"url form",
+			"postgresql://postgres:s3cret@db.example.com:5432/postgres",
+			"postgresql://postgres:***@db.example.com:5432/postgres",
+		},
+		{
+			"url without password",
+			"postgresql://postgres@db.example.com:5432/postgres",
+			"postgresql://postgres@db.example.com:5432/postgres",
+		},
+		{
+			"no password at all",
+			"dbname=ducklake_v1 host=localhost",
+			"dbname=ducklake_v1 host=localhost",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := redactDSN(tc.in); got != tc.want {
+				t.Errorf("redactDSN(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+			}
+			if strings.Contains(redactDSN(tc.in), "s3cret") {
+				t.Error("password leaked through redaction")
 			}
 		})
 	}

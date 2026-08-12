@@ -1385,6 +1385,9 @@ If using a local Postgres metadata store, the database must already exist:
 			if setupConn.DucklakeSecret == "" && setupConn.MetadataStore != "postgres" && setupConn.MetadataStore != "duckdb" {
 				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", setupConn.MetadataStore)
 			}
+			if err := resolvePgDSN(cmd, &setupConn); err != nil {
+				return err
+			}
 			return runSetup(setupConn)
 		},
 	}
@@ -1408,6 +1411,9 @@ Prompts for confirmation unless --force is set.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if resetConn.DucklakeSecret == "" && resetConn.MetadataStore != "postgres" && resetConn.MetadataStore != "duckdb" {
 				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", resetConn.MetadataStore)
+			}
+			if err := resolvePgDSN(cmd, &resetConn); err != nil {
+				return err
 			}
 			return runReset(resetConn, forceReset)
 		},
@@ -1464,12 +1470,15 @@ Modes:
 			if schemaDriftRate < 0 || schemaDriftRate > 1 {
 				return fmt.Errorf("--schema-drift-rate must be between 0.0 and 1.0, got %.2f", schemaDriftRate)
 			}
+			if err := resolvePgDSN(cmd, &runConn); err != nil {
+				return err
+			}
 
 		// ── banner ──────────────────────────────────────────────────────
 		postgresSink := runConn.isPostgresSink()
 		if postgresSink {
 			rule("Postgres Source Data Load")
-			fmt.Printf("  Postgres DSN : %s%s%s\n", green, runConn.PgDSN, reset)
+			fmt.Printf("  Postgres DSN : %s%s%s\n", green, redactDSN(runConn.PgDSN), reset)
 			fmt.Printf("  Table        : %s%s%s\n", green, runConn.getPostgresTableName(table), reset)
 		} else {
 			rule("DuckLake Stream Benchmark")

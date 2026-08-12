@@ -48,6 +48,9 @@ type ConnectionConfig struct {
 	// Inline mode.
 	MetadataStore string // "postgres" | "duckdb"
 	PgDSN         string
+	// PgDSNFile: path to a file holding the DSN, so credentials stay out of
+	// shell history and process listings. Read into PgDSN by resolvePgDSN.
+	PgDSNFile string
 	// METADATA_SCHEMA: the Postgres schema DuckLake stores its metadata
 	// tables in. Defaults to Postgres "public" if left empty. Set this to
 	// scope a shared/managed Postgres (like Supabase) to a dedicated schema.
@@ -270,11 +273,85 @@ func registerConnectionFlags(cmd *cobra.Command, cfg *ConnectionConfig) {
 	cmd.Flags().StringVar(&cfg.MetadataCatalogName, "metadata-catalog-name", "", "Expose DuckLake's metadata tables under this name in DuckDB (METADATA_CATALOG); omit to keep them hidden")
 	cmd.Flags().StringVar(&cfg.MetadataStore, "metadata-store", "postgres", "Metadata store backend: 'postgres' or 'duckdb' (ignored when --ducklake-secret is set)")
 	cmd.Flags().StringVar(&cfg.PgDSN, "pg-dsn", "dbname=ducklake_v1 host=localhost", "Postgres DSN for the metadata store; works for local Postgres or a remote/managed Postgres such as Supabase, e.g. \"host=db.xxxx.supabase.co port=5432 dbname=postgres user=postgres password=... sslmode=require\" (postgres mode only)")
+	cmd.Flags().StringVar(&cfg.PgDSNFile, "pg-dsn-file", "", "Path to a file containing the Postgres DSN, keeping credentials out of shell history; mutually exclusive with --pg-dsn. Supports # comments and one key per line")
 	cmd.Flags().StringVar(&cfg.MetadataSchema, "metadata-schema", "", "Postgres schema DuckLake stores its metadata tables in (METADATA_SCHEMA); defaults to Postgres 'public' if unset (postgres mode only)")
 	cmd.Flags().StringVar(&cfg.DataPath, "data-path", "./ducklake_data", "Where Parquet data files are stored: a local directory, or an s3://bucket/prefix URI")
 	cmd.Flags().StringVar(&cfg.S3KeyID, "s3-key-id", "", "AWS access key ID, used only when --data-path is an s3:// URI (falls back to AWS_ACCESS_KEY_ID)")
 	cmd.Flags().StringVar(&cfg.S3SecretKey, "s3-secret-key", "", "AWS secret access key, used only when --data-path is an s3:// URI (falls back to AWS_SECRET_ACCESS_KEY)")
 	cmd.Flags().StringVar(&cfg.S3Region, "s3-region", "", "AWS region for the S3 bucket, used only when --data-path is an s3:// URI (falls back to AWS_REGION)")
+}
+
+// resolvePgDSN loads the DSN from --pg-dsn-file when that flag is set,
+// replacing whatever is in PgDSN. Call this from a command's RunE before the
+// DSN is used.
+//
+// The file may span multiple lines and use # comments; non-comment lines are
+// joined with a space, so a DSN can be laid out one key per line.
+func resolvePgDSN(cmd *cobra.Command, cfg *ConnectionConfig) error {
+	if cfg.PgDSNFile == "" {
+		return nil
+	}
+	if cmd.Flags().Changed("pg-dsn") {
+		return fmt.Errorf("--pg-dsn and --pg-dsn-file are mutually exclusive; pick one")
+	}
+
+	raw, err := os.ReadFile(cfg.PgDSNFile)
+	if err != nil {
+		return fmt.Errorf("read --pg-dsn-file: %w", err)
+	}
+
+	var parts []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts = append(parts, line)
+	}
+
+	dsn := strings.Join(parts, " ")
+	if dsn == "" {
+		return fmt.Errorf("--pg-dsn-file %s contains no connection string", cfg.PgDSNFile)
+	}
+	cfg.PgDSN = dsn
+
+	// A DSN file usually holds a password, so flag overly permissive modes
+	// rather than silently accepting them.
+	if info, err := os.Stat(cfg.PgDSNFile); err == nil {
+		if mode := info.Mode().Perm(); mode&0o077 != 0 {
+			fmt.Fprintf(os.Stderr,
+				"warning: %s is readable by other users (mode %04o); consider: chmod 600 %s\n",
+				cfg.PgDSNFile, mode, cfg.PgDSNFile)
+		}
+	}
+	return nil
+}
+
+// redactDSN masks the password in a DSN so it can be printed. It handles both
+// keyword form (password=secret) and URL form (postgres://user:secret@host).
+func redactDSN(dsn string) string {
+	const mask = "***"
+
+	// URL form: scheme://user:password@host
+	if i := strings.Index(dsn, "://"); i >= 0 {
+		rest := dsn[i+3:]
+		if at := strings.LastIndex(rest, "@"); at >= 0 {
+			userinfo := rest[:at]
+			if colon := strings.Index(userinfo, ":"); colon >= 0 {
+				return dsn[:i+3] + userinfo[:colon+1] + mask + rest[at:]
+			}
+		}
+		return dsn
+	}
+
+	// Keyword form: space-separated key=value pairs.
+	fields := strings.Fields(dsn)
+	for i, f := range fields {
+		if strings.HasPrefix(f, "password=") {
+			fields[i] = "password=" + mask
+		}
+	}
+	return strings.Join(fields, " ")
 }
 
 func printConnectionSummary(cfg ConnectionConfig) {
@@ -297,7 +374,7 @@ func printConnectionSummary(cfg ConnectionConfig) {
 			kind = "remote"
 		}
 		fmt.Printf("  Metadata store : %sPostgreSQL%s (%s%s%s)\n", green, reset, dim, kind, reset)
-		fmt.Printf("  Postgres DSN   : %s%s%s\n", green, cfg.PgDSN, reset)
+		fmt.Printf("  Postgres DSN   : %s%s%s\n", green, redactDSN(cfg.PgDSN), reset)
 		if cfg.MetadataSchema != "" {
 			fmt.Printf("  Metadata schema: %s%s%s\n", green, cfg.MetadataSchema, reset)
 		}
