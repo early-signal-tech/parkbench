@@ -114,6 +114,17 @@ func sqlArray(ss []string) string {
 	return "[" + strings.Join(quoted, ", ") + "]"
 }
 
+// sqlArrayPostgres formats a string array as a Postgres ARRAY literal
+func sqlArrayPostgres(ss []string) string {
+	quoted := make([]string, len(ss))
+	for i, s := range ss {
+		// Escape single quotes in the string
+		escaped := strings.ReplaceAll(s, "'", "''")
+		quoted[i] = "'" + escaped + "'"
+	}
+	return "ARRAY[" + strings.Join(quoted, ", ") + "]"
+}
+
 // ── SQL generation ────────────────────────────────────────────────────────────
 
 func batchSQLSimple(fqt string, startID, batchSize int, distribution string, hotspotDays int) string {
@@ -228,11 +239,11 @@ func batchSQLSimplePostgres(fqt string, startID, batchSize int, distribution str
 		SELECT
 			row_number() OVER () + %d AS id,
 			%s AS ts,
-			(ARRAY%v)[((random() * %d)::int %% %d) + 1] AS event_type
+			%s[((random() * %d)::int %% %d) + 1] AS event_type
 		FROM generate_series(1, %d)`,
 		fqt, startID,
 		tsExpr,
-		eventTypes, len(eventTypes), len(eventTypes),
+		sqlArrayPostgres(eventTypes), len(eventTypes), len(eventTypes),
 		batchSize,
 	)
 }
@@ -255,30 +266,30 @@ func batchSQLRichPostgres(fqt string, startID, batchSize int, distribution strin
 
 	// Build JSON payload inline
 	payloadExpr := fmt.Sprintf(`jsonb_build_object(
-		'event_type', (ARRAY%v)[((random() * %d)::int %% %d) + 1],
-		'page', (ARRAY%v)[((random() * %d)::int %% %d) + 1],
-		'source', (ARRAY%v)[((random() * %d)::int %% %d) + 1],
-		'country', (ARRAY%v)[((random() * %d)::int %% %d) + 1]
+		'event_type', %s[((random() * %d)::int %% %d) + 1],
+		'page', %s[((random() * %d)::int %% %d) + 1],
+		'source', %s[((random() * %d)::int %% %d) + 1],
+		'country', %s[((random() * %d)::int %% %d) + 1]
 	)`,
-		eventTypes, len(eventTypes), len(eventTypes),
-		pages, len(pages), len(pages),
-		sources, len(sources), len(sources),
-		countries, len(countries), len(countries),
+		sqlArrayPostgres(eventTypes), len(eventTypes), len(eventTypes),
+		sqlArrayPostgres(pages), len(pages), len(pages),
+		sqlArrayPostgres(sources), len(sources), len(sources),
+		sqlArrayPostgres(countries), len(countries), len(countries),
 	)
 
 	return fmt.Sprintf(`
 		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata)
 		SELECT
 			row_number() OVER () + %d AS id,
-			(ARRAY%v)[((random() * %d)::int %% %d) + 1] AS user_id,
-			(ARRAY%v)[((random() * %d)::int %% %d) + 1] AS event_type,
+			%s[((random() * %d)::int %% %d) + 1] AS user_id,
+			%s[((random() * %d)::int %% %d) + 1] AS event_type,
 			%s AS ts,
 			%s AS payload,
 			jsonb_build_object('timestamp', now()) AS metadata
 		FROM generate_series(1, %d)`,
 		fqt, startID,
-		streamUsers, len(streamUsers), len(streamUsers),
-		eventTypes, len(eventTypes), len(eventTypes),
+		sqlArrayPostgres(streamUsers), len(streamUsers), len(streamUsers),
+		sqlArrayPostgres(eventTypes), len(eventTypes), len(eventTypes),
 		tsExpr,
 		payloadExpr,
 		batchSize,
