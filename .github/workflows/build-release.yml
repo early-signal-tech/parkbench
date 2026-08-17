@@ -17,7 +17,7 @@ jobs:
             artifact: parkbench-windows-amd64.exe
 
     steps:
-      - uses: actions/checkout@v4.1.7
+      - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
@@ -27,7 +27,7 @@ jobs:
         run: go build -o ${{ matrix.artifact }} .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4.3.1
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -39,10 +39,10 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4.1.7
+      - uses: actions/checkout@v4
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4.1.7
+        uses: actions/download-artifact@v4
         with:
           path: ./artifacts
 
