@@ -103,8 +103,14 @@ Inserts rows continuously and prints throughput stats.
 # batch mode, rich schema
 ./parkbench run --mode rich
 
+# batch mode, rich_ml schema (200 users, ML-optimized data)
+./parkbench run --mode rich_ml --num-users 200 --batch-size 50000 --num-batches 20
+
 # ticker mode (1 row/sec for 60s)
 ./parkbench run --run-mode ticker --duration 60
+
+# ticker mode, rich_ml schema (streaming ML training data)
+./parkbench run --mode rich_ml --num-users 500 --run-mode ticker --duration 300
 
 # ticker mode with 15% duplicate injection
 ./parkbench run --run-mode ticker --duration 60 --duplicate-rate 0.15
@@ -134,9 +140,10 @@ Inserts rows continuously and prints throughput stats.
 | `--metadata-schema` | _(none)_ | Postgres schema for DuckLake's metadata tables (`METADATA_SCHEMA`); defaults to `public` |
 | `--data-path` | `./ducklake_data` | Parquet data directory: a local directory, or an `s3://bucket/prefix` URI |
 | `--s3-key-id` / `--s3-secret-key` / `--s3-region` | _(none)_ | S3 credentials, used only when `--data-path` is `s3://...`; fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` |
-| `--mode`, `-m` | `simple` | Schema mode: `simple` or `rich` |
+| `--mode`, `-m` | `simple` | Schema mode: `simple`, `rich`, or `rich_ml` (ML-optimized) |
+| `--num-users` | `100` | Number of distinct users for `rich_ml` mode (configurable user profiles with realistic behavior patterns); ignored for `simple` and `rich` modes |
 | `--run-mode`, `-r` | `batch` | Run mode: `batch` or `ticker` |
-| `--table`, `-t` | _(auto)_ | Table name (defaults to `events` or `events_rich`) |
+| `--table`, `-t` | _(auto)_ | Table name (defaults to `events`, `events_rich`, or `events_rich_ml` depending on schema mode) |
 | `--batch-size`, `-b` | `100000` | Rows per batch (batch mode only) |
 | `--num-batches`, `-n` | `10` | Number of batches; `0` = run forever |
 | `--flush-interval`, `-k` | `10` | Flush inlined rows to Parquet every N batches (batch mode) or at end if inlined rows > N (ticker mode); `0` = never |
@@ -154,6 +161,44 @@ id INTEGER, ts TIMESTAMP, event_type VARCHAR
 **rich** — `wh.events_rich`
 ```sql
 id INTEGER, user_id VARCHAR, event_type VARCHAR, ts TIMESTAMP, payload JSON, metadata JSON
+```
+
+**rich_ml** — `wh.events_rich_ml` (ML-optimized with enriched features and user profiles)
+```sql
+id INTEGER,
+user_id VARCHAR,
+event_type VARCHAR,
+ts TIMESTAMP,
+payload JSON,        -- includes: page, duration_ms, value, device_type, referrer, session_number, previous_purchase_count
+metadata JSON,       -- includes: source, country, session_id, ab_variant, user_tier, days_since_signup
+user_attributes JSON -- includes: tier, signup_days_ago, country, mrr_value
+```
+
+**rich_ml** is designed for machine learning use cases with:
+- **20+ event types** (view, click, add_to_cart, checkout_start, purchase, etc.)
+- **Configurable user pool** (default 100, configurable via `--num-users`)
+- **User profiles** with tier (free/starter/pro/enterprise), account age, MRR value, and cohort patterns
+- **Enriched payload** with device types (web, mobile_ios, mobile_android, tablet), referrers, session tracking
+- **Realistic distributions** that simulate power-law user behavior and time-based patterns
+
+**Example rich_ml queries:**
+```sql
+-- User segments
+SELECT user_attributes->>'tier' as tier, COUNT(*) as events FROM wh.events_rich_ml GROUP BY 1;
+
+-- Conversion events
+SELECT COUNT(*) FROM wh.events_rich_ml WHERE event_type = 'purchase';
+
+-- Device breakdown
+SELECT payload->>'device_type' as device, COUNT(*) as count FROM wh.events_rich_ml GROUP BY 1;
+
+-- User lifetime value correlation
+SELECT 
+  user_attributes->>'tier' as tier,
+  COUNT(*) as events,
+  AVG((payload->>'value')::NUMERIC) as avg_value
+FROM wh.events_rich_ml
+GROUP BY 1;
 ```
 
 **rejected (dead letter)** — `wh.events_rejected`

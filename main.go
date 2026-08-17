@@ -44,7 +44,73 @@ var (
 		}
 		return users
 	}()
+
+	// ML-specific vocabulary
+	eventTypesML = []string{
+		"view", "click", "add_to_cart", "remove_from_cart", "search",
+		"checkout_start", "checkout_complete", "payment_error", "purchase",
+		"login", "logout", "signup", "account_update", "support_ticket",
+		"share", "wishlist_add", "wishlist_remove", "review", "rating",
+		"coupon_applied", "coupon_removed", "category_browse", "filter_applied",
+	}
+	pagesML = []string{
+		"/home", "/products", "/product/detail", "/category", "/search",
+		"/cart", "/checkout", "/checkout/payment", "/checkout/confirmation",
+		"/account", "/account/settings", "/account/orders", "/account/wishlist",
+		"/help", "/about", "/contact", "/blog", "/promotions",
+	}
+	devicesML = []string{"web", "mobile_ios", "mobile_android", "tablet"}
+	referrersML = []string{
+		"direct", "google", "facebook", "instagram", "twitter",
+		"linkedin", "newsletter", "affiliate", "paid_search", "organic_search",
+	}
+	userTiersML = []string{"free", "starter", "pro", "enterprise"}
 )
+
+type userProfileML struct {
+	UserID          string
+	Tier            string
+	SignupDaysAgo   int
+	Country         string
+	MRRValue        float64
+	Cohort          string
+	PreviousPurchases int
+}
+
+func generateUserProfileML(userIdx int, numUsers int) userProfileML {
+	tier := userTiersML[userIdx%len(userTiersML)]
+	country := countries[userIdx%len(countries)]
+	cohortIdx := (userIdx / len(userTiersML)) % 4
+	cohorts := []string{"power_user", "casual", "churning", "new"}
+	cohort := cohorts[cohortIdx]
+
+	signupDaysAgo := 10 + (userIdx % 350)
+	if cohort == "new" {
+		signupDaysAgo = userIdx % 30
+	} else if cohort == "churning" {
+		signupDaysAgo = 180 + (userIdx % 90)
+	}
+
+	tierMRR := map[string]float64{"free": 0, "starter": 9.99, "pro": 49.99, "enterprise": 299.99}[tier]
+	mrrValue := tierMRR * (0.5 + rand.Float64())
+
+	previousPurchases := 0
+	if cohort == "power_user" {
+		previousPurchases = 10 + rand.Intn(50)
+	} else if cohort == "casual" {
+		previousPurchases = rand.Intn(5)
+	}
+
+	return userProfileML{
+		UserID:            fmt.Sprintf("user_%d", userIdx+1),
+		Tier:              tier,
+		SignupDaysAgo:     signupDaysAgo,
+		Country:           country,
+		MRRValue:          mrrValue,
+		Cohort:            cohort,
+		PreviousPurchases: previousPurchases,
+	}
+}
 
 // ── flush state management ────────────────────────────────────────────────
 
@@ -212,6 +278,74 @@ func batchSQLRich(fqt string, startID, batchSize int, distribution string, hotsp
 	)
 }
 
+func batchSQLRichML(fqt string, startID, batchSize int, distribution string, hotspotDays int, numUsers int) string {
+	var tsExpr string
+	if distribution == "hotspot" {
+		oldestSeconds := hotspotDays * 24 * 3600
+		tsExpr = fmt.Sprintf(`CASE
+			WHEN random() < 0.7 THEN now() - INTERVAL (random() * 21600) SECOND
+			ELSE now() - INTERVAL (21600 + random() * %d) SECOND
+		END`, oldestSeconds-21600)
+	} else if distribution == "yesterday" {
+		tsExpr = "CAST(CURRENT_DATE() - 1 AS TIMESTAMP) + INTERVAL (random() * 86400) SECOND"
+	} else if distribution == "last_week" {
+		tsExpr = "now() - INTERVAL (random() * 604800) SECOND"
+	} else {
+		tsExpr = "now() - INTERVAL (random() * 86400) SECOND"
+	}
+
+	userIDs := make([]string, numUsers)
+	for i := range userIDs {
+		userIDs[i] = fmt.Sprintf("user_%d", i+1)
+	}
+
+	return fmt.Sprintf(`
+		INSERT INTO %s
+		SELECT
+			range + %d                                                           AS id,
+			(%s)[1 + (random() * %d)::INT]                                      AS user_id,
+			(%s)[1 + (random() * %d)::INT]                                      AS event_type,
+			%s                                                                   AS ts,
+			{
+				'page':              (%s)[1 + (random() * %d)::INT],
+				'duration_ms':       (100 + (random() * 9900)::INT),
+				'value':             round(random() * 499.99 + 0.01, 2),
+				'device_type':       (%s)[1 + (random() * %d)::INT],
+				'referrer':          (%s)[1 + (random() * %d)::INT],
+				'session_number':    (1 + (random() * 100)::INT),
+				'previous_purchase_count': (random() * 50)::INT
+			}::JSON                                                           AS payload,
+			{
+				'source':           (%s)[1 + (random() * %d)::INT],
+				'country':          (%s)[1 + (random() * %d)::INT],
+				'session_id':       'sess_' || (1 + (random() * 999999)::BIGINT)::VARCHAR,
+				'ab_variant':       CASE WHEN random() > 0.5 THEN 'A' ELSE 'B' END,
+				'user_tier':        (%s)[1 + (random() * %d)::INT],
+				'days_since_signup': (10 + (random() * 350)::INT)
+			}::JSON                                                           AS metadata,
+			{
+				'tier':               (%s)[1 + (random() * %d)::INT],
+				'signup_days_ago':   (10 + (random() * 350)::INT),
+				'country':           (%s)[1 + (random() * %d)::INT],
+				'mrr_value':         round((random() * 300)::numeric, 2)
+			}::JSON                                                           AS user_attributes
+		FROM range(%d)`,
+		fqt, startID,
+		sqlArray(userIDs), len(userIDs)-1,
+		sqlArray(eventTypesML), len(eventTypesML)-1,
+		tsExpr,
+		sqlArray(pagesML), len(pagesML)-1,
+		sqlArray(devicesML), len(devicesML)-1,
+		sqlArray(referrersML), len(referrersML)-1,
+		sqlArray(sources), len(sources)-1,
+		sqlArray(countries), len(countries)-1,
+		sqlArray(userTiersML), len(userTiersML)-1,
+		sqlArray(userTiersML), len(userTiersML)-1,
+		sqlArray(countries), len(countries)-1,
+		batchSize,
+	)
+}
+
 // ── Postgres-specific batch SQL (standard SQL, no DuckDB extensions) ─────────
 //
 // The DuckDB generators rely on range(), struct literals and INTERVAL <expr>
@@ -284,6 +418,59 @@ func batchSQLRichPostgres(fqt string, startID, batchSize int, distribution strin
 		pgTimestampExpr(distribution, hotspotDays),
 		pgPick(pages),
 		pgPick(sources),
+		pgPick(countries),
+		startID, startID+batchSize-1,
+	)
+}
+
+func batchSQLRichMLPostgres(fqt string, startID, batchSize int, distribution string, hotspotDays int, numUsers int) string {
+	userIDs := make([]string, numUsers)
+	for i := range userIDs {
+		userIDs[i] = fmt.Sprintf("user_%d", i+1)
+	}
+
+	return fmt.Sprintf(`
+		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata, user_attributes)
+		SELECT
+			i          AS id,
+			%s         AS user_id,
+			%s         AS event_type,
+			%s         AS ts,
+			json_build_object(
+				'page',                    %s,
+				'duration_ms',             (100 + (random() * 9900)::int),
+				'value',                   round((random() * 499.99 + 0.01)::numeric, 2),
+				'device_type',             %s,
+				'referrer',                %s,
+				'session_number',          (1 + (random() * 100)::int),
+				'previous_purchase_count', (random() * 50)::int
+			)          AS payload,
+			json_build_object(
+				'source',                  %s,
+				'country',                 %s,
+				'session_id',              'sess_' || (1 + (random() * 999999)::bigint)::text,
+				'ab_variant',              CASE WHEN random() > 0.5 THEN 'A' ELSE 'B' END,
+				'user_tier',               %s,
+				'days_since_signup',       (10 + (random() * 350)::int)
+			)          AS metadata,
+			json_build_object(
+				'tier',                    %s,
+				'signup_days_ago',         (10 + (random() * 350)::int),
+				'country',                 %s,
+				'mrr_value',               round((random() * 300)::numeric, 2)
+			)          AS user_attributes
+		FROM generate_series(%d, %d) AS s(i)`,
+		fqt,
+		pgPick(userIDs),
+		pgPick(eventTypesML),
+		pgTimestampExpr(distribution, hotspotDays),
+		pgPick(pagesML),
+		pgPick(devicesML),
+		pgPick(referrersML),
+		pgPick(sources),
+		pgPick(countries),
+		pgPick(userTiersML),
+		pgPick(userTiersML),
 		pgPick(countries),
 		startID, startID+batchSize-1,
 	)
@@ -392,6 +579,62 @@ func tickerSQLRich(fqt string, id int, userID string) string {
 	)
 }
 
+func tickerSQLRichML(fqt string, id int, userID string, profile userProfileML) string {
+	return fmt.Sprintf(`
+		INSERT INTO %s
+		VALUES (
+			%d,
+			'%s',
+			%s,
+			now(),
+			{
+				'page':                    %s,
+				'duration_ms':             %d,
+				'value':                   %.2f,
+				'device_type':             %s,
+				'referrer':                %s,
+				'session_number':          %d,
+				'previous_purchase_count': %d
+			}::JSON,
+			{
+				'source':                  %s,
+				'country':                 %s,
+				'session_id':              'sess_' || (%d)::VARCHAR,
+				'ab_variant':              '%s',
+				'user_tier':               '%s',
+				'days_since_signup':       %d
+			}::JSON,
+			{
+				'tier':                    '%s',
+				'signup_days_ago':         %d,
+				'country':                 '%s',
+				'mrr_value':               %.2f
+			}::JSON
+		)`,
+		fqt,
+		id,
+		userID,
+		"'"+eventTypesML[id%len(eventTypesML)]+"'",
+		"'"+pagesML[id%len(pagesML)]+"'",
+		100+id%9900,
+		float64(id)*0.01+0.01,
+		"'"+devicesML[id%len(devicesML)]+"'",
+		"'"+referrersML[id%len(referrersML)]+"'",
+		1+id%100,
+		profile.PreviousPurchases+id%10,
+		"'"+sources[id%len(sources)]+"'",
+		"'"+profile.Country+"'",
+		1+id%999999,
+		map[int]string{0: "A", 1: "B"}[id%2],
+		profile.Tier,
+		profile.SignupDaysAgo,
+		profile.Tier,
+		profile.SignupDaysAgo,
+		profile.Country,
+		profile.MRRValue,
+	)
+}
+
 // The DuckDB ticker generators above use struct literals ({...}::JSON), so the
 // postgres sink needs json_build_object equivalents.
 
@@ -434,6 +677,62 @@ func tickerSQLRichPostgres(fqt string, id int, userID string) string {
 		countries[id%len(countries)],
 		1+id%999999,
 		map[int]string{0: "A", 1: "B"}[id%2],
+	)
+}
+
+func tickerSQLRichMLPostgres(fqt string, id int, userID string, profile userProfileML) string {
+	return fmt.Sprintf(`
+		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata, user_attributes)
+		VALUES (
+			%d,
+			'%s',
+			'%s',
+			now(),
+			json_build_object(
+				'page',                    '%s',
+				'duration_ms',             %d,
+				'value',                   %.2f,
+				'device_type',             '%s',
+				'referrer',                '%s',
+				'session_number',          %d,
+				'previous_purchase_count', %d
+			),
+			json_build_object(
+				'source',                  '%s',
+				'country',                 '%s',
+				'session_id',              'sess_%d',
+				'ab_variant',              '%s',
+				'user_tier',               '%s',
+				'days_since_signup',       %d
+			),
+			json_build_object(
+				'tier',                    '%s',
+				'signup_days_ago',         %d,
+				'country',                 '%s',
+				'mrr_value',               %.2f
+			)
+		)`,
+		fqt,
+		id,
+		userID,
+		eventTypesML[id%len(eventTypesML)],
+		pagesML[id%len(pagesML)],
+		100+id%9900,
+		float64(id)*0.01+0.01,
+		devicesML[id%len(devicesML)],
+		referrersML[id%len(referrersML)],
+		1+id%100,
+		profile.PreviousPurchases+id%10,
+		sources[id%len(sources)],
+		profile.Country,
+		1+id%999999,
+		map[int]string{0: "A", 1: "B"}[id%2],
+		profile.Tier,
+		profile.SignupDaysAgo,
+		profile.Tier,
+		profile.SignupDaysAgo,
+		profile.Country,
+		profile.MRRValue,
 	)
 }
 
@@ -620,6 +919,16 @@ const richDDL = `CREATE TABLE IF NOT EXISTS %s (
 	ts          TIMESTAMP,
 	payload     JSON,
 	metadata    JSON
+)`
+
+const richMLDDL = `CREATE TABLE IF NOT EXISTS %s (
+	id               INTEGER,
+	user_id          VARCHAR,
+	event_type       VARCHAR,
+	ts               TIMESTAMP,
+	payload          JSON,
+	metadata         JSON,
+	user_attributes  JSON
 )`
 
 const rejectedEventsDDL = `CREATE TABLE IF NOT EXISTS %s (
@@ -810,6 +1119,7 @@ func runBatchMode(
 	checkpointInterval int,
 	distribution string,
 	hotspotDays int,
+	numUsers int,
 	sigCh chan os.Signal,
 ) error {
 	fqt := catalogName + "." + table
@@ -817,6 +1127,8 @@ func runBatchMode(
 	ddl := simpleDDL
 	if schemaMode == "rich" {
 		ddl = richDDL
+	} else if schemaMode == "rich_ml" {
+		ddl = richMLDDL
 	}
 	if _, err := db.Exec(fmt.Sprintf(ddl, fqt)); err != nil {
 		return fmt.Errorf("create table: %w", err)
@@ -825,6 +1137,11 @@ func runBatchMode(
 	sqlGen := batchSQLSimple
 	if schemaMode == "rich" {
 		sqlGen = batchSQLRich
+	} else if schemaMode == "rich_ml" {
+		// For rich_ml, we need a wrapper that accepts numUsers
+		sqlGen = func(fqt string, startID, batchSize int, dist string, hotspot int) string {
+			return batchSQLRichML(fqt, startID, batchSize, dist, hotspot, numUsers)
+		}
 	}
 
 	maxID, err := getMaxID(db, catalogName, table)
@@ -920,6 +1237,7 @@ func runTickerMode(
 	checkpointInterval int,
 	duplicateRate float64,
 	schemaDriftRate float64,
+	numUsers int,
 	sigCh chan os.Signal,
 ) error {
 	fqt := catalogName + "." + table
@@ -927,6 +1245,8 @@ func runTickerMode(
 	ddl := simpleDDL
 	if schemaMode == "rich" {
 		ddl = richDDL
+	} else if schemaMode == "rich_ml" {
+		ddl = richMLDDL
 	}
 	if _, err := db.Exec(fmt.Sprintf(ddl, fqt)); err != nil {
 		return fmt.Errorf("create table: %w", err)
@@ -945,6 +1265,9 @@ func runTickerMode(
 	if schemaMode == "rich" {
 		fmt.Printf("  User pool     : %s%d%s users (%suser_1..user_%d%s), random per event\n",
 			green, len(streamUsers), reset, dim, len(streamUsers), reset)
+	} else if schemaMode == "rich_ml" {
+		fmt.Printf("  User pool     : %s%d%s users (%suser_1..user_%d%s), with ML profiles\n",
+			green, numUsers, reset, dim, numUsers, reset)
 	}
 
 	var (
@@ -954,6 +1277,14 @@ func runTickerMode(
 		startTotal = time.Now()
 		tickNum    int
 	)
+
+	// Pre-generate user profiles for rich_ml mode
+	userProfiles := make([]userProfileML, numUsers)
+	if schemaMode == "rich_ml" {
+		for i := range userProfiles {
+			userProfiles[i] = generateUserProfileML(i, numUsers)
+		}
+	}
 
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -981,6 +1312,13 @@ loop:
 			if schemaMode == "rich" {
 				userID = streamUsers[rand.Intn(len(streamUsers))]
 				query = tickerSQLRich(fqt, id, userID)
+				driftSQL = tickerSQLRichDrifted(fqt, id, userID)
+				driftPayload = richDriftPayload(id, userID)
+			} else if schemaMode == "rich_ml" {
+				userIdx := rand.Intn(numUsers)
+				profile := userProfiles[userIdx]
+				userID = profile.UserID
+				query = tickerSQLRichML(fqt, id, userID, profile)
 				driftSQL = tickerSQLRichDrifted(fqt, id, userID)
 				driftPayload = richDriftPayload(id, userID)
 			} else {
@@ -1095,6 +1433,7 @@ func runBatchModePostgresSink(
 	numBatches int,
 	distribution string,
 	hotspotDays int,
+	numUsers int,
 	sigCh chan os.Signal,
 ) error {
 	// Use schema-qualified table name if schema is specified
@@ -1119,6 +1458,16 @@ func runBatchModePostgresSink(
 			payload     JSON,
 			metadata    JSON
 		)`, fqt)
+	} else if schemaMode == "rich_ml" {
+		ddl = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			id               INTEGER,
+			user_id          VARCHAR,
+			event_type       VARCHAR,
+			ts               TIMESTAMP,
+			payload          JSON,
+			metadata         JSON,
+			user_attributes  JSON
+		)`, fqt)
 	}
 	if _, err := db.Exec(ddl); err != nil {
 		return fmt.Errorf("create table: %w", err)
@@ -1137,6 +1486,10 @@ func runBatchModePostgresSink(
 	sqlGen := batchSQLSimplePostgres
 	if schemaMode == "rich" {
 		sqlGen = batchSQLRichPostgres
+	} else if schemaMode == "rich_ml" {
+		sqlGen = func(fqt string, startID, batchSize int, dist string, hotspot int) string {
+			return batchSQLRichMLPostgres(fqt, startID, batchSize, dist, hotspot, numUsers)
+		}
 	}
 
 	var (
@@ -1212,6 +1565,7 @@ func runTickerModePostgresSink(
 	duration int,
 	duplicateRate float64,
 	schemaDriftRate float64,
+	numUsers int,
 	sigCh chan os.Signal,
 ) error {
 	// Use schema-qualified table name if schema is specified
@@ -1236,6 +1590,16 @@ func runTickerModePostgresSink(
 			payload     JSON,
 			metadata    JSON
 		)`, fqt)
+	} else if schemaMode == "rich_ml" {
+		ddl = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			id               INTEGER,
+			user_id          VARCHAR,
+			event_type       VARCHAR,
+			ts               TIMESTAMP,
+			payload          JSON,
+			metadata         JSON,
+			user_attributes  JSON
+		)`, fqt)
 	}
 	if _, err := db.Exec(ddl); err != nil {
 		return fmt.Errorf("create table: %w", err)
@@ -1256,6 +1620,14 @@ func runTickerModePostgresSink(
 		startTotal = time.Now()
 		tickNum    int
 	)
+
+	// Pre-generate user profiles for rich_ml mode
+	userProfiles := make([]userProfileML, numUsers)
+	if schemaMode == "rich_ml" {
+		for i := range userProfiles {
+			userProfiles[i] = generateUserProfileML(i, numUsers)
+		}
+	}
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -1280,6 +1652,10 @@ loop:
 			if schemaMode == "rich" {
 				userID := streamUsers[rand.Intn(len(streamUsers))]
 				query = tickerSQLRichPostgres(fqt, int(id), userID)
+			} else if schemaMode == "rich_ml" {
+				userIdx := rand.Intn(numUsers)
+				profile := userProfiles[userIdx]
+				query = tickerSQLRichMLPostgres(fqt, int(id), profile.UserID, profile)
 			} else {
 				query = tickerSQLSimplePostgres(fqt, int(id))
 			}
@@ -1354,6 +1730,7 @@ func main() {
 		duration           int
 		duplicateRate      float64
 		schemaDriftRate    float64
+		numUsers           int
 	)
 
 	rootCmd := &cobra.Command{
@@ -1431,9 +1808,11 @@ Prompts for confirmation unless --force is set.`,
 		Long: `Run benchmarks on an existing DuckLake catalog.
 
 Modes:
-  Schema modes (simple, rich):
-    simple  — {id, ts, event_type}
-    rich    — {id, user_id, event_type, ts, payload JSON, metadata JSON}
+  Schema modes (simple, rich, rich_ml):
+    simple   — {id, ts, event_type}
+    rich     — {id, user_id, event_type, ts, payload JSON, metadata JSON}
+    rich_ml  — {id, user_id, event_type, ts, payload JSON, metadata JSON, user_attributes JSON}
+              (ML-optimized: enriched features, user profiles, realistic distributions)
 
   Run modes (batch, ticker):
     batch   — Inserts large batches of rows (default)
@@ -1442,18 +1821,25 @@ Modes:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if table == "" {
 				switch {
+				case runConn.isPostgresSink() && schemaMode == "rich_ml":
+					table = "events_rich_ml_source"
 				case runConn.isPostgresSink() && schemaMode == "rich":
 					table = "events_rich_source"
 				case runConn.isPostgresSink():
 					table = "events_source"
+				case schemaMode == "rich_ml":
+					table = "events_rich_ml"
 				case schemaMode == "rich":
 					table = "events_rich"
 				default:
 					table = "events"
 				}
 			}
-			if schemaMode != "simple" && schemaMode != "rich" {
-				return fmt.Errorf("--mode must be 'simple' or 'rich', got %q", schemaMode)
+			if schemaMode != "simple" && schemaMode != "rich" && schemaMode != "rich_ml" {
+				return fmt.Errorf("--mode must be 'simple', 'rich', or 'rich_ml', got %q", schemaMode)
+			}
+			if schemaMode == "rich_ml" && numUsers <= 0 {
+				return fmt.Errorf("--num-users must be > 0 for rich_ml mode, got %d", numUsers)
 			}
 			if runMode != "batch" && runMode != "ticker" {
 				return fmt.Errorf("--run-mode must be 'batch' or 'ticker', got %q", runMode)
@@ -1486,6 +1872,9 @@ Modes:
 			fmt.Printf("  Table        : %s%s.%s%s\n", green, runConn.CatalogName, table, reset)
 		}
 			fmt.Printf("  Schema mode  : %s%s%s\n", green, schemaMode, reset)
+			if schemaMode == "rich_ml" {
+				fmt.Printf("  User pool    : %s%d%s users with ML profiles\n", green, numUsers, reset)
+			}
 			fmt.Printf("  Run mode     : %s%s%s\n", green, runMode, reset)
 			fmt.Printf("  Distribution : %s%s%s\n", green, distribution, reset)
 			if distribution == "hotspot" {
@@ -1567,20 +1956,21 @@ Modes:
 		// ── run selected mode ───────────────────────────────────────────
 		if runConn.isPostgresSink() {
 			if runMode == "ticker" {
-				return runTickerModePostgresSink(db, runConn, table, schemaMode, duration, duplicateRate, schemaDriftRate, sigCh)
+				return runTickerModePostgresSink(db, runConn, table, schemaMode, duration, duplicateRate, schemaDriftRate, numUsers, sigCh)
 			}
-			return runBatchModePostgresSink(db, runConn, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, distribution, hotspotDays, sigCh)
+			return runBatchModePostgresSink(db, runConn, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, distribution, hotspotDays, numUsers, sigCh)
 		}
 		if runMode == "ticker" {
-			return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, sigCh)
+			return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, numUsers, sigCh)
 		}
-		return runBatchMode(db, runConn.CatalogName, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, checkpointInterval, distribution, hotspotDays, sigCh)
+		return runBatchMode(db, runConn.CatalogName, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, checkpointInterval, distribution, hotspotDays, numUsers, sigCh)
 		},
 	}
 
 	registerConnectionFlags(runCmd, &runConn)
-	runCmd.Flags().StringVarP(&table, "table", "t", "", "Target table (defaults to 'events' or 'events_rich')")
-	runCmd.Flags().StringVarP(&schemaMode, "mode", "m", "simple", "Schema mode: simple or rich")
+	runCmd.Flags().StringVarP(&table, "table", "t", "", "Target table (defaults to 'events', 'events_rich', or 'events_rich_ml')")
+	runCmd.Flags().StringVarP(&schemaMode, "mode", "m", "simple", "Schema mode: simple, rich, or rich_ml (ML-optimized with enriched features)")
+	runCmd.Flags().IntVar(&numUsers, "num-users", 100, "Number of distinct users for rich_ml mode (required for rich_ml, ignored for other modes)")
 	runCmd.Flags().StringVarP(&runMode, "run-mode", "r", "batch", "Run mode: batch or ticker")
 	runCmd.Flags().StringVar(&distribution, "distribution", "uniform", "Timestamp distribution: 'uniform' (past 24h), 'hotspot' (70% in last 6h, 30% spread), 'yesterday' (previous day only), or 'last_week' (past 7 days)")
 	runCmd.Flags().IntVar(&hotspotDays, "hotspot-days", 30, "Number of days to spread the 30% tail in hotspot distribution (hotspot mode only)")
