@@ -328,7 +328,12 @@ func batchSQLRichML(fqt string, startID, batchSize int, distribution string, hot
 				'signup_days_ago':   (10 + (random() * 350)::INT),
 				'country':           (%s)[1 + (random() * %d)::INT],
 				'mrr_value':         round((random() * 300)::numeric, 2)
-			}::JSON                                                           AS user_attributes
+			}::JSON                                                           AS user_attributes,
+			{
+				'is_converted':      CASE WHEN random() < 0.15 THEN true ELSE false END,
+				'churned_7d':        CASE WHEN random() < 0.08 THEN true ELSE false END,
+				'revenue_7d':        round((random() * 500)::numeric, 2)
+			}::JSON                                                           AS ml_labels
 		FROM range(%d)`,
 		fqt, startID,
 		sqlArray(userIDs), len(userIDs)-1,
@@ -430,7 +435,7 @@ func batchSQLRichMLPostgres(fqt string, startID, batchSize int, distribution str
 	}
 
 	return fmt.Sprintf(`
-		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata, user_attributes)
+		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata, user_attributes, ml_labels)
 		SELECT
 			i          AS id,
 			%s         AS user_id,
@@ -458,7 +463,12 @@ func batchSQLRichMLPostgres(fqt string, startID, batchSize int, distribution str
 				'signup_days_ago',         (10 + (random() * 350)::int),
 				'country',                 %s,
 				'mrr_value',               round((random() * 300)::numeric, 2)
-			)          AS user_attributes
+			)          AS user_attributes,
+			json_build_object(
+				'is_converted',            random() < 0.15,
+				'churned_7d',              random() < 0.08,
+				'revenue_7d',              round((random() * 500)::numeric, 2)
+			)          AS ml_labels
 		FROM generate_series(%d, %d) AS s(i)`,
 		fqt,
 		pgPick(userIDs),
@@ -609,6 +619,11 @@ func tickerSQLRichML(fqt string, id int, userID string, profile userProfileML) s
 				'signup_days_ago':         %d,
 				'country':                 '%s',
 				'mrr_value':               %.2f
+			}::JSON,
+			{
+				'is_converted':            %v,
+				'churned_7d':              %v,
+				'revenue_7d':              %.2f
 			}::JSON
 		)`,
 		fqt,
@@ -632,6 +647,9 @@ func tickerSQLRichML(fqt string, id int, userID string, profile userProfileML) s
 		profile.SignupDaysAgo,
 		profile.Country,
 		profile.MRRValue,
+		id%100 < 15,
+		id%100 < 8,
+		float64(id%500),
 	)
 }
 
@@ -682,7 +700,7 @@ func tickerSQLRichPostgres(fqt string, id int, userID string) string {
 
 func tickerSQLRichMLPostgres(fqt string, id int, userID string, profile userProfileML) string {
 	return fmt.Sprintf(`
-		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata, user_attributes)
+		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata, user_attributes, ml_labels)
 		VALUES (
 			%d,
 			'%s',
@@ -710,6 +728,11 @@ func tickerSQLRichMLPostgres(fqt string, id int, userID string, profile userProf
 				'signup_days_ago',         %d,
 				'country',                 '%s',
 				'mrr_value',               %.2f
+			),
+			json_build_object(
+				'is_converted',            %v,
+				'churned_7d',              %v,
+				'revenue_7d',              %.2f
 			)
 		)`,
 		fqt,
@@ -733,6 +756,9 @@ func tickerSQLRichMLPostgres(fqt string, id int, userID string, profile userProf
 		profile.SignupDaysAgo,
 		profile.Country,
 		profile.MRRValue,
+		id%100 < 15,
+		id%100 < 8,
+		float64(id%500),
 	)
 }
 
@@ -928,7 +954,8 @@ const richMLDDL = `CREATE TABLE IF NOT EXISTS %s (
 	ts               TIMESTAMP,
 	payload          JSON,
 	metadata         JSON,
-	user_attributes  JSON
+	user_attributes  JSON,
+	ml_labels        JSON
 )`
 
 const rejectedEventsDDL = `CREATE TABLE IF NOT EXISTS %s (
@@ -1466,7 +1493,8 @@ func runBatchModePostgresSink(
 			ts               TIMESTAMP,
 			payload          JSON,
 			metadata         JSON,
-			user_attributes  JSON
+			user_attributes  JSON,
+			ml_labels        JSON
 		)`, fqt)
 	}
 	if _, err := db.Exec(ddl); err != nil {
@@ -1598,7 +1626,8 @@ func runTickerModePostgresSink(
 			ts               TIMESTAMP,
 			payload          JSON,
 			metadata         JSON,
-			user_attributes  JSON
+			user_attributes  JSON,
+			ml_labels        JSON
 		)`, fqt)
 	}
 	if _, err := db.Exec(ddl); err != nil {
