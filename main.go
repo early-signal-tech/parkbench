@@ -33,10 +33,10 @@ import (
 // ── vocabulary used in generated SQL ─────────────────────────────────────────
 
 var (
-	eventTypes = []string{"click", "view", "purchase", "signup", "logout", "search", "share"}
-	pages      = []string{"/home", "/product", "/cart", "/checkout", "/profile", "/search", "/settings"}
-	sources    = []string{"web", "mobile", "api", "email", "push"}
-	countries  = []string{"US", "GB", "DE", "FR", "JP", "CA", "AU", "BR"}
+	eventTypes  = []string{"click", "view", "purchase", "signup", "logout", "search", "share"}
+	pages       = []string{"/home", "/product", "/cart", "/checkout", "/profile", "/search", "/settings"}
+	sources     = []string{"web", "mobile", "api", "email", "push"}
+	countries   = []string{"US", "GB", "DE", "FR", "JP", "CA", "AU", "BR"}
 	streamUsers = func() []string {
 		users := make([]string, 20)
 		for i := range users {
@@ -59,7 +59,7 @@ var (
 		"/account", "/account/settings", "/account/orders", "/account/wishlist",
 		"/help", "/about", "/contact", "/blog", "/promotions",
 	}
-	devicesML = []string{"web", "mobile_ios", "mobile_android", "tablet"}
+	devicesML   = []string{"web", "mobile_ios", "mobile_android", "tablet"}
 	referrersML = []string{
 		"direct", "google", "facebook", "instagram", "twitter",
 		"linkedin", "newsletter", "affiliate", "paid_search", "organic_search",
@@ -68,12 +68,12 @@ var (
 )
 
 type userProfileML struct {
-	UserID          string
-	Tier            string
-	SignupDaysAgo   int
-	Country         string
-	MRRValue        float64
-	Cohort          string
+	UserID            string
+	Tier              string
+	SignupDaysAgo     int
+	Country           string
+	MRRValue          float64
+	Cohort            string
 	PreviousPurchases int
 }
 
@@ -110,6 +110,48 @@ func generateUserProfileML(userIdx int, numUsers int) userProfileML {
 		Cohort:            cohort,
 		PreviousPurchases: previousPurchases,
 	}
+}
+
+// ── ML ground-truth label ─────────────────────────────────────────────────
+//
+// rich_ml can carry a single binary classification target, is_converted, as a
+// typed BOOLEAN column. It is opt-in: when Enabled is false the column is left
+// out of both the DDL and every INSERT, so rich_ml keeps its original shape.
+
+const mlLabelColumn = "is_converted"
+
+type mlLabelsConfig struct {
+	Enabled        bool
+	ConversionRate float64
+}
+
+// batchColumn renders the trailing is_converted select item for the batch
+// generators, or "" when the label is disabled. random() < rate is valid in
+// both DuckDB and Postgres, so both sinks share it.
+func (c mlLabelsConfig) batchColumn() string {
+	if !c.Enabled {
+		return ""
+	}
+	return fmt.Sprintf(`,
+			random() < %g                                                        AS %s`,
+		c.ConversionRate, mlLabelColumn)
+}
+
+// tickerValue renders the trailing is_converted VALUES item for a single row.
+func (c mlLabelsConfig) tickerValue() string {
+	if !c.Enabled {
+		return ""
+	}
+	return fmt.Sprintf(`,
+			%v`, rand.Float64() < c.ConversionRate)
+}
+
+// columnSuffix appends is_converted to an INSERT column list when enabled.
+func (c mlLabelsConfig) columnSuffix() string {
+	if !c.Enabled {
+		return ""
+	}
+	return ", " + mlLabelColumn
 }
 
 // ── flush state management ────────────────────────────────────────────────
@@ -278,7 +320,7 @@ func batchSQLRich(fqt string, startID, batchSize int, distribution string, hotsp
 	)
 }
 
-func batchSQLRichML(fqt string, startID, batchSize int, distribution string, hotspotDays int, numUsers int) string {
+func batchSQLRichML(fqt string, startID, batchSize int, distribution string, hotspotDays int, numUsers int, mlCfg mlLabelsConfig) string {
 	var tsExpr string
 	if distribution == "hotspot" {
 		oldestSeconds := hotspotDays * 24 * 3600
@@ -328,12 +370,7 @@ func batchSQLRichML(fqt string, startID, batchSize int, distribution string, hot
 				'signup_days_ago':   (10 + (random() * 350)::INT),
 				'country':           (%s)[1 + (random() * %d)::INT],
 				'mrr_value':         round((random() * 300)::numeric, 2)
-			}::JSON                                                           AS user_attributes,
-			{
-				'is_converted':      CASE WHEN random() < 0.15 THEN true ELSE false END,
-				'churned_7d':        CASE WHEN random() < 0.08 THEN true ELSE false END,
-				'revenue_7d':        round((random() * 500)::numeric, 2)
-			}::JSON                                                           AS ml_labels
+			}::JSON                                                           AS user_attributes%s
 		FROM range(%d)`,
 		fqt, startID,
 		sqlArray(userIDs), len(userIDs)-1,
@@ -347,6 +384,7 @@ func batchSQLRichML(fqt string, startID, batchSize int, distribution string, hot
 		sqlArray(userTiersML), len(userTiersML)-1,
 		sqlArray(userTiersML), len(userTiersML)-1,
 		sqlArray(countries), len(countries)-1,
+		mlCfg.batchColumn(),
 		batchSize,
 	)
 }
@@ -428,14 +466,14 @@ func batchSQLRichPostgres(fqt string, startID, batchSize int, distribution strin
 	)
 }
 
-func batchSQLRichMLPostgres(fqt string, startID, batchSize int, distribution string, hotspotDays int, numUsers int) string {
+func batchSQLRichMLPostgres(fqt string, startID, batchSize int, distribution string, hotspotDays int, numUsers int, mlCfg mlLabelsConfig) string {
 	userIDs := make([]string, numUsers)
 	for i := range userIDs {
 		userIDs[i] = fmt.Sprintf("user_%d", i+1)
 	}
 
 	return fmt.Sprintf(`
-		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata, user_attributes, ml_labels)
+		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata, user_attributes%s)
 		SELECT
 			i          AS id,
 			%s         AS user_id,
@@ -463,14 +501,10 @@ func batchSQLRichMLPostgres(fqt string, startID, batchSize int, distribution str
 				'signup_days_ago',         (10 + (random() * 350)::int),
 				'country',                 %s,
 				'mrr_value',               round((random() * 300)::numeric, 2)
-			)          AS user_attributes,
-			json_build_object(
-				'is_converted',            random() < 0.15,
-				'churned_7d',              random() < 0.08,
-				'revenue_7d',              round((random() * 500)::numeric, 2)
-			)          AS ml_labels
+			)          AS user_attributes%s
 		FROM generate_series(%d, %d) AS s(i)`,
 		fqt,
+		mlCfg.columnSuffix(),
 		pgPick(userIDs),
 		pgPick(eventTypesML),
 		pgTimestampExpr(distribution, hotspotDays),
@@ -482,6 +516,7 @@ func batchSQLRichMLPostgres(fqt string, startID, batchSize int, distribution str
 		pgPick(userTiersML),
 		pgPick(userTiersML),
 		pgPick(countries),
+		mlCfg.batchColumn(),
 		startID, startID+batchSize-1,
 	)
 }
@@ -589,7 +624,7 @@ func tickerSQLRich(fqt string, id int, userID string) string {
 	)
 }
 
-func tickerSQLRichML(fqt string, id int, userID string, profile userProfileML) string {
+func tickerSQLRichML(fqt string, id int, userID string, profile userProfileML, mlCfg mlLabelsConfig) string {
 	return fmt.Sprintf(`
 		INSERT INTO %s
 		VALUES (
@@ -619,12 +654,7 @@ func tickerSQLRichML(fqt string, id int, userID string, profile userProfileML) s
 				'signup_days_ago':         %d,
 				'country':                 '%s',
 				'mrr_value':               %.2f
-			}::JSON,
-			{
-				'is_converted':            %v,
-				'churned_7d':              %v,
-				'revenue_7d':              %.2f
-			}::JSON
+			}::JSON%s
 		)`,
 		fqt,
 		id,
@@ -647,9 +677,7 @@ func tickerSQLRichML(fqt string, id int, userID string, profile userProfileML) s
 		profile.SignupDaysAgo,
 		profile.Country,
 		profile.MRRValue,
-		id%100 < 15,
-		id%100 < 8,
-		float64(id%500),
+		mlCfg.tickerValue(),
 	)
 }
 
@@ -698,9 +726,9 @@ func tickerSQLRichPostgres(fqt string, id int, userID string) string {
 	)
 }
 
-func tickerSQLRichMLPostgres(fqt string, id int, userID string, profile userProfileML) string {
+func tickerSQLRichMLPostgres(fqt string, id int, userID string, profile userProfileML, mlCfg mlLabelsConfig) string {
 	return fmt.Sprintf(`
-		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata, user_attributes, ml_labels)
+		INSERT INTO %s (id, user_id, event_type, ts, payload, metadata, user_attributes%s)
 		VALUES (
 			%d,
 			'%s',
@@ -728,14 +756,10 @@ func tickerSQLRichMLPostgres(fqt string, id int, userID string, profile userProf
 				'signup_days_ago',         %d,
 				'country',                 '%s',
 				'mrr_value',               %.2f
-			),
-			json_build_object(
-				'is_converted',            %v,
-				'churned_7d',              %v,
-				'revenue_7d',              %.2f
-			)
+			)%s
 		)`,
 		fqt,
+		mlCfg.columnSuffix(),
 		id,
 		userID,
 		eventTypesML[id%len(eventTypesML)],
@@ -756,9 +780,7 @@ func tickerSQLRichMLPostgres(fqt string, id int, userID string, profile userProf
 		profile.SignupDaysAgo,
 		profile.Country,
 		profile.MRRValue,
-		id%100 < 15,
-		id%100 < 8,
-		float64(id%500),
+		mlCfg.tickerValue(),
 	)
 }
 
@@ -954,9 +976,44 @@ const richMLDDL = `CREATE TABLE IF NOT EXISTS %s (
 	ts               TIMESTAMP,
 	payload          JSON,
 	metadata         JSON,
-	user_attributes  JSON,
-	ml_labels        JSON
+	user_attributes  JSON
 )`
+
+const richMLLabelsDDL = `CREATE TABLE IF NOT EXISTS %s (
+	id               INTEGER,
+	user_id          VARCHAR,
+	event_type       VARCHAR,
+	ts               TIMESTAMP,
+	payload          JSON,
+	metadata         JSON,
+	user_attributes  JSON,
+	is_converted     BOOLEAN
+)`
+
+func richMLDDLFor(mlCfg mlLabelsConfig) string {
+	if mlCfg.Enabled {
+		return richMLLabelsDDL
+	}
+	return richMLDDL
+}
+
+// pgRichMLDDLFor is the postgres-sink counterpart of richMLDDLFor.
+func pgRichMLDDLFor(mlCfg mlLabelsConfig) string {
+	ddl := `CREATE TABLE IF NOT EXISTS %s (
+		id               INTEGER,
+		user_id          VARCHAR,
+		event_type       VARCHAR,
+		ts               TIMESTAMP,
+		payload          JSON,
+		metadata         JSON,
+		user_attributes  JSON`
+	if mlCfg.Enabled {
+		ddl += `,
+		is_converted     BOOLEAN`
+	}
+	return ddl + `
+	)`
+}
 
 const rejectedEventsDDL = `CREATE TABLE IF NOT EXISTS %s (
 	rejected_at     TIMESTAMP,
@@ -1147,6 +1204,7 @@ func runBatchMode(
 	distribution string,
 	hotspotDays int,
 	numUsers int,
+	mlCfg mlLabelsConfig,
 	sigCh chan os.Signal,
 ) error {
 	fqt := catalogName + "." + table
@@ -1155,7 +1213,7 @@ func runBatchMode(
 	if schemaMode == "rich" {
 		ddl = richDDL
 	} else if schemaMode == "rich_ml" {
-		ddl = richMLDDL
+		ddl = richMLDDLFor(mlCfg)
 	}
 	if _, err := db.Exec(fmt.Sprintf(ddl, fqt)); err != nil {
 		return fmt.Errorf("create table: %w", err)
@@ -1167,7 +1225,7 @@ func runBatchMode(
 	} else if schemaMode == "rich_ml" {
 		// For rich_ml, we need a wrapper that accepts numUsers
 		sqlGen = func(fqt string, startID, batchSize int, dist string, hotspot int) string {
-			return batchSQLRichML(fqt, startID, batchSize, dist, hotspot, numUsers)
+			return batchSQLRichML(fqt, startID, batchSize, dist, hotspot, numUsers, mlCfg)
 		}
 	}
 
@@ -1197,34 +1255,34 @@ loop:
 		default:
 		}
 
-	batchNum++
-	startID := nextID
-	
-	// Use randomized batch size if min/max provided, otherwise use fixed batchSize
-	currentBatchSize := batchSize
-	if batchSizeMin > 0 || batchSizeMax > 0 {
-		min, max := batchSizeMin, batchSizeMax
-		if min <= 0 {
-			min = 1
-		}
-		if max <= 0 {
-			max = batchSize
-		}
-		if min > max {
-			min, max = max, min
-		}
-		currentBatchSize = min + rand.Intn(max-min+1)
-	}
-	nextID += currentBatchSize
+		batchNum++
+		startID := nextID
 
-	query := sqlGen(fqt, startID, currentBatchSize, distribution, hotspotDays)
-	t0 := time.Now()
-	if _, err := db.Exec(query); err != nil {
-		return fmt.Errorf("batch %d insert: %w", batchNum, err)
-	}
-	batchSecs := time.Since(t0).Seconds()
+		// Use randomized batch size if min/max provided, otherwise use fixed batchSize
+		currentBatchSize := batchSize
+		if batchSizeMin > 0 || batchSizeMax > 0 {
+			min, max := batchSizeMin, batchSizeMax
+			if min <= 0 {
+				min = 1
+			}
+			if max <= 0 {
+				max = batchSize
+			}
+			if min > max {
+				min, max = max, min
+			}
+			currentBatchSize = min + rand.Intn(max-min+1)
+		}
+		nextID += currentBatchSize
 
-	cumulative += int64(currentBatchSize)
+		query := sqlGen(fqt, startID, currentBatchSize, distribution, hotspotDays)
+		t0 := time.Now()
+		if _, err := db.Exec(query); err != nil {
+			return fmt.Errorf("batch %d insert: %w", batchNum, err)
+		}
+		batchSecs := time.Since(t0).Seconds()
+
+		cumulative += int64(currentBatchSize)
 		elapsedTotal := time.Since(startTotal).Seconds()
 
 		if checkpointInterval > 0 && batchNum%checkpointInterval == 0 {
@@ -1235,9 +1293,9 @@ loop:
 			flushInfo = fmt.Sprintf("%.2fs", time.Since(f0).Seconds())
 		}
 
-	s := getStorageStats(db, catalogName, table)
-	printStats(batchNum, numBatches, currentBatchSize, batchSecs,
-		cumulative, elapsedTotal, s, flushInfo)
+		s := getStorageStats(db, catalogName, table)
+		printStats(batchNum, numBatches, currentBatchSize, batchSecs,
+			cumulative, elapsedTotal, s, flushInfo)
 	}
 
 	elapsedTotal := time.Since(startTotal).Seconds()
@@ -1265,6 +1323,7 @@ func runTickerMode(
 	duplicateRate float64,
 	schemaDriftRate float64,
 	numUsers int,
+	mlCfg mlLabelsConfig,
 	sigCh chan os.Signal,
 ) error {
 	fqt := catalogName + "." + table
@@ -1273,7 +1332,7 @@ func runTickerMode(
 	if schemaMode == "rich" {
 		ddl = richDDL
 	} else if schemaMode == "rich_ml" {
-		ddl = richMLDDL
+		ddl = richMLDDLFor(mlCfg)
 	}
 	if _, err := db.Exec(fmt.Sprintf(ddl, fqt)); err != nil {
 		return fmt.Errorf("create table: %w", err)
@@ -1345,7 +1404,7 @@ loop:
 				userIdx := rand.Intn(numUsers)
 				profile := userProfiles[userIdx]
 				userID = profile.UserID
-				query = tickerSQLRichML(fqt, id, userID, profile)
+				query = tickerSQLRichML(fqt, id, userID, profile, mlCfg)
 				driftSQL = tickerSQLRichDrifted(fqt, id, userID)
 				driftPayload = richDriftPayload(id, userID)
 			} else {
@@ -1403,14 +1462,14 @@ loop:
 	if checkpointInterval > 0 {
 		s := getStorageStats(db, catalogName, table)
 		newRowsSinceFlush := s.total - state.LastFlushedCount
-		
+
 		if newRowsSinceFlush > int64(checkpointInterval) {
 			fmt.Printf("\n%sCheckpointing %s%d%s rows to Parquet...%s\n",
 				cyan+bold, bold, newRowsSinceFlush, reset, reset)
 			fmt.Printf("%s(Total in table: %s%d%s, Last flushed: %s%d%s)%s\n",
 				dim, bold, s.total, reset,
 				bold, state.LastFlushedCount, reset, reset)
-			
+
 			if _, err := db.Exec(fmt.Sprintf("CALL ducklake_flush_inlined_data('%s')", catalogName)); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: final flush failed: %v\n", err)
 			} else {
@@ -1419,7 +1478,7 @@ loop:
 				if err := saveState(catalogName, table, state); err != nil {
 					fmt.Fprintf(os.Stderr, "warning: failed to save state: %v\n", err)
 				}
-				
+
 				// Refresh stats after flush
 				s = getStorageStats(db, catalogName, table)
 				fmt.Printf("%s✓ Flush complete.%s Total rows in table: %s%d%s\n",
@@ -1461,6 +1520,7 @@ func runBatchModePostgresSink(
 	distribution string,
 	hotspotDays int,
 	numUsers int,
+	mlCfg mlLabelsConfig,
 	sigCh chan os.Signal,
 ) error {
 	// Use schema-qualified table name if schema is specified
@@ -1486,16 +1546,7 @@ func runBatchModePostgresSink(
 			metadata    JSON
 		)`, fqt)
 	} else if schemaMode == "rich_ml" {
-		ddl = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			id               INTEGER,
-			user_id          VARCHAR,
-			event_type       VARCHAR,
-			ts               TIMESTAMP,
-			payload          JSON,
-			metadata         JSON,
-			user_attributes  JSON,
-			ml_labels        JSON
-		)`, fqt)
+		ddl = fmt.Sprintf(pgRichMLDDLFor(mlCfg), fqt)
 	}
 	if _, err := db.Exec(ddl); err != nil {
 		return fmt.Errorf("create table: %w", err)
@@ -1516,7 +1567,7 @@ func runBatchModePostgresSink(
 		sqlGen = batchSQLRichPostgres
 	} else if schemaMode == "rich_ml" {
 		sqlGen = func(fqt string, startID, batchSize int, dist string, hotspot int) string {
-			return batchSQLRichMLPostgres(fqt, startID, batchSize, dist, hotspot, numUsers)
+			return batchSQLRichMLPostgres(fqt, startID, batchSize, dist, hotspot, numUsers, mlCfg)
 		}
 	}
 
@@ -1594,6 +1645,7 @@ func runTickerModePostgresSink(
 	duplicateRate float64,
 	schemaDriftRate float64,
 	numUsers int,
+	mlCfg mlLabelsConfig,
 	sigCh chan os.Signal,
 ) error {
 	// Use schema-qualified table name if schema is specified
@@ -1619,16 +1671,7 @@ func runTickerModePostgresSink(
 			metadata    JSON
 		)`, fqt)
 	} else if schemaMode == "rich_ml" {
-		ddl = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			id               INTEGER,
-			user_id          VARCHAR,
-			event_type       VARCHAR,
-			ts               TIMESTAMP,
-			payload          JSON,
-			metadata         JSON,
-			user_attributes  JSON,
-			ml_labels        JSON
-		)`, fqt)
+		ddl = fmt.Sprintf(pgRichMLDDLFor(mlCfg), fqt)
 	}
 	if _, err := db.Exec(ddl); err != nil {
 		return fmt.Errorf("create table: %w", err)
@@ -1684,7 +1727,7 @@ loop:
 			} else if schemaMode == "rich_ml" {
 				userIdx := rand.Intn(numUsers)
 				profile := userProfiles[userIdx]
-				query = tickerSQLRichMLPostgres(fqt, int(id), profile.UserID, profile)
+				query = tickerSQLRichMLPostgres(fqt, int(id), profile.UserID, profile, mlCfg)
 			} else {
 				query = tickerSQLSimplePostgres(fqt, int(id))
 			}
@@ -1760,6 +1803,8 @@ func main() {
 		duplicateRate      float64
 		schemaDriftRate    float64
 		numUsers           int
+		mlLabels           bool
+		conversionRate     float64
 	)
 
 	rootCmd := &cobra.Command{
@@ -1870,6 +1915,12 @@ Modes:
 			if schemaMode == "rich_ml" && numUsers <= 0 {
 				return fmt.Errorf("--num-users must be > 0 for rich_ml mode, got %d", numUsers)
 			}
+			if mlLabels && schemaMode != "rich_ml" {
+				return fmt.Errorf("--ml-labels requires --mode rich_ml, got %q", schemaMode)
+			}
+			if conversionRate < 0 || conversionRate > 1 {
+				return fmt.Errorf("--conversion-rate must be between 0.0 and 1.0, got %.2f", conversionRate)
+			}
 			if runMode != "batch" && runMode != "ticker" {
 				return fmt.Errorf("--run-mode must be 'batch' or 'ticker', got %q", runMode)
 			}
@@ -1889,20 +1940,26 @@ Modes:
 				return err
 			}
 
-		// ── banner ──────────────────────────────────────────────────────
-		postgresSink := runConn.isPostgresSink()
-		if postgresSink {
-			rule("Postgres Source Data Load")
-			fmt.Printf("  Postgres DSN : %s%s%s\n", green, redactDSN(runConn.PgDSN), reset)
-			fmt.Printf("  Table        : %s%s%s\n", green, runConn.getPostgresTableName(table), reset)
-		} else {
-			rule("DuckLake Stream Benchmark")
-			printConnectionSummary(runConn)
-			fmt.Printf("  Table        : %s%s.%s%s\n", green, runConn.CatalogName, table, reset)
-		}
+			// ── banner ──────────────────────────────────────────────────────
+			postgresSink := runConn.isPostgresSink()
+			if postgresSink {
+				rule("Postgres Source Data Load")
+				fmt.Printf("  Postgres DSN : %s%s%s\n", green, redactDSN(runConn.PgDSN), reset)
+				fmt.Printf("  Table        : %s%s%s\n", green, runConn.getPostgresTableName(table), reset)
+			} else {
+				rule("DuckLake Stream Benchmark")
+				printConnectionSummary(runConn)
+				fmt.Printf("  Table        : %s%s.%s%s\n", green, runConn.CatalogName, table, reset)
+			}
 			fmt.Printf("  Schema mode  : %s%s%s\n", green, schemaMode, reset)
 			if schemaMode == "rich_ml" {
 				fmt.Printf("  User pool    : %s%d%s users with ML profiles\n", green, numUsers, reset)
+				if mlLabels {
+					fmt.Printf("  ML label     : %s%s BOOLEAN%s (%.0f%% positive)\n",
+						green, mlLabelColumn, reset, conversionRate*100)
+				} else {
+					fmt.Printf("  ML label     : %soff%s (enable with --ml-labels)\n", dim, reset)
+				}
 			}
 			fmt.Printf("  Run mode     : %s%s%s\n", green, runMode, reset)
 			fmt.Printf("  Distribution : %s%s%s\n", green, distribution, reset)
@@ -1963,36 +2020,41 @@ Modes:
 					fmt.Printf("  Schema drift : %sdisabled%s\n", green, reset)
 				}
 			}
-		fmt.Println()
+			fmt.Println()
 
-		// ── open connection ─────────────────────────────────────────────
-		var db *sql.DB
-		var err error
-		if runConn.isPostgresSink() {
-			db, err = openPostgres(runConn)
-		} else {
-			db, err = openAndAttach(runConn)
-		}
-		if err != nil {
-			return err
-		}
-		defer db.Close()
-
-		// ── signal handling ─────────────────────────────────────────────
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-
-		// ── run selected mode ───────────────────────────────────────────
-		if runConn.isPostgresSink() {
-			if runMode == "ticker" {
-				return runTickerModePostgresSink(db, runConn, table, schemaMode, duration, duplicateRate, schemaDriftRate, numUsers, sigCh)
+			// ── open connection ─────────────────────────────────────────────
+			var db *sql.DB
+			var err error
+			if runConn.isPostgresSink() {
+				db, err = openPostgres(runConn)
+			} else {
+				db, err = openAndAttach(runConn)
 			}
-			return runBatchModePostgresSink(db, runConn, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, distribution, hotspotDays, numUsers, sigCh)
-		}
-		if runMode == "ticker" {
-			return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, numUsers, sigCh)
-		}
-		return runBatchMode(db, runConn.CatalogName, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, checkpointInterval, distribution, hotspotDays, numUsers, sigCh)
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+
+			// ── signal handling ─────────────────────────────────────────────
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+			mlCfg := mlLabelsConfig{
+				Enabled:        mlLabels,
+				ConversionRate: conversionRate,
+			}
+
+			// ── run selected mode ───────────────────────────────────────────
+			if runConn.isPostgresSink() {
+				if runMode == "ticker" {
+					return runTickerModePostgresSink(db, runConn, table, schemaMode, duration, duplicateRate, schemaDriftRate, numUsers, mlCfg, sigCh)
+				}
+				return runBatchModePostgresSink(db, runConn, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, distribution, hotspotDays, numUsers, mlCfg, sigCh)
+			}
+			if runMode == "ticker" {
+				return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, numUsers, mlCfg, sigCh)
+			}
+			return runBatchMode(db, runConn.CatalogName, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, checkpointInterval, distribution, hotspotDays, numUsers, mlCfg, sigCh)
 		},
 	}
 
@@ -2000,6 +2062,8 @@ Modes:
 	runCmd.Flags().StringVarP(&table, "table", "t", "", "Target table (defaults to 'events', 'events_rich', or 'events_rich_ml')")
 	runCmd.Flags().StringVarP(&schemaMode, "mode", "m", "simple", "Schema mode: simple, rich, or rich_ml (ML-optimized with enriched features)")
 	runCmd.Flags().IntVar(&numUsers, "num-users", 100, "Number of distinct users for rich_ml mode (required for rich_ml, ignored for other modes)")
+	runCmd.Flags().BoolVar(&mlLabels, "ml-labels", false, "Add an is_converted BOOLEAN label column to rich_ml events; omitted entirely when unset")
+	runCmd.Flags().Float64Var(&conversionRate, "conversion-rate", 0.15, "Probability (0.0–1.0) that is_converted is true (requires --ml-labels)")
 	runCmd.Flags().StringVarP(&runMode, "run-mode", "r", "batch", "Run mode: batch or ticker")
 	runCmd.Flags().StringVar(&distribution, "distribution", "uniform", "Timestamp distribution: 'uniform' (past 24h), 'hotspot' (70% in last 6h, 30% spread), 'yesterday' (previous day only), or 'last_week' (past 7 days)")
 	runCmd.Flags().IntVar(&hotspotDays, "hotspot-days", 30, "Number of days to spread the 30% tail in hotspot distribution (hotspot mode only)")

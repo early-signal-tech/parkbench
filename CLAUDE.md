@@ -112,6 +112,12 @@ Inserts rows continuously and prints throughput stats.
 # ticker mode, rich_ml schema (streaming ML training data)
 ./parkbench run --mode rich_ml --num-users 500 --run-mode ticker --duration 300
 
+# rich_ml with the ML label column (adds is_converted BOOLEAN)
+./parkbench run --mode rich_ml --num-users 200 --ml-labels
+
+# rich_ml with a custom positive-class rate
+./parkbench run --mode rich_ml --ml-labels --conversion-rate 0.30
+
 # ticker mode with 15% duplicate injection
 ./parkbench run --run-mode ticker --duration 60 --duplicate-rate 0.15
 
@@ -142,6 +148,8 @@ Inserts rows continuously and prints throughput stats.
 | `--s3-key-id` / `--s3-secret-key` / `--s3-region` | _(none)_ | S3 credentials, used only when `--data-path` is `s3://...`; fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` |
 | `--mode`, `-m` | `simple` | Schema mode: `simple`, `rich`, or `rich_ml` (ML-optimized) |
 | `--num-users` | `100` | Number of distinct users for `rich_ml` mode (configurable user profiles with realistic behavior patterns); ignored for `simple` and `rich` modes |
+| `--ml-labels` | `false` | Add an `is_converted BOOLEAN` label column to `rich_ml` events; when unset the column is absent from both the DDL and every insert. Requires `--mode rich_ml` |
+| `--conversion-rate` | `0.15` | Probability (0.0–1.0) that `is_converted` is true; requires `--ml-labels` |
 | `--run-mode`, `-r` | `batch` | Run mode: `batch` or `ticker` |
 | `--table`, `-t` | _(auto)_ | Table name (defaults to `events`, `events_rich`, or `events_rich_ml` depending on schema mode) |
 | `--batch-size`, `-b` | `100000` | Rows per batch (batch mode only) |
@@ -180,6 +188,36 @@ user_attributes JSON -- includes: tier, signup_days_ago, country, mrr_value
 - **User profiles** with tier (free/starter/pro/enterprise), account age, MRR value, and cohort patterns
 - **Enriched payload** with device types (web, mobile_ios, mobile_android, tablet), referrers, session tracking
 - **Realistic distributions** that simulate power-law user behavior and time-based patterns
+
+**Optional ML label** — pass `--ml-labels` to add a single binary classification target as an eighth column:
+
+```sql
+is_converted BOOLEAN
+```
+
+It is a real typed column, not a JSON key, so it needs no extraction or cast:
+
+```sql
+SELECT COUNT(*) FROM wh.events_rich_ml WHERE is_converted;
+```
+
+The column is opt-in. Without the flag it is absent from the `CREATE TABLE` and from every insert, so `events_rich_ml` keeps its seven-column shape. `--conversion-rate` controls the positive-class rate (default `0.15`, i.e. ~15% `true`), which is a realistic level of class imbalance for conversion modelling.
+
+### Schema evolution
+
+Because `is_converted` is part of the table definition, a table created without `--ml-labels` will not gain the column on a later run. Flipping the flag on against an existing table fails cleanly, with nothing written:
+
+```
+Error: batch 1 insert: Binder Error: table events_rich_ml has 7 columns but 8 values were supplied
+```
+
+Either reset the table (or use a different `--table`), or evolve it in place — DuckLake records this as its own snapshot with a `schema_version` bump, and does not rewrite existing Parquet files:
+
+```sql
+ALTER TABLE wh.events_rich_ml ADD COLUMN is_converted BOOLEAN;
+```
+
+Rows written before the `ALTER` read back as `NULL` for the new column; rows written after carry the label.
 
 **Example rich_ml queries:**
 ```sql
