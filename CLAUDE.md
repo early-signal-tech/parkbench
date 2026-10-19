@@ -156,6 +156,7 @@ Inserts rows continuously and prints throughput stats.
 | `--num-batches`, `-n` | `10` | Number of batches; `0` = run forever |
 | `--flush-interval`, `-k` | `10` | Flush inlined rows to Parquet every N batches (batch mode) or at end if inlined rows > N (ticker mode); `0` = never |
 | `--duration`, `-d` | `60` | Duration in seconds (ticker mode only) |
+| `--partition-by` | _(none)_ | Partition the table's future writes (batch mode, DuckLake only): a comma-separated list of columns or transforms (`year`, `month`, `day`, `hour`, `bucket(N, col)`), e.g. `"year(ts), month(ts), day(ts)"`. Runs `ALTER TABLE ... SET PARTITIONED BY (...)` after table creation; existing Parquet files are not rewritten. Pair with `--distribution last_week` or `hotspot` so batches span several partitions |
 | `--duplicate-rate` | `0.0` | Probability (0.0–1.0) of injecting a duplicate row on each tick (ticker mode only); e.g. `0.15` = ~15% duplicates |
 | `--schema-drift-rate` | `0.0` | Probability (0.0–1.0) of injecting a schema-breaking row on each tick (ticker mode only); the insert targets an unknown column (`event_category` for simple, `schema_version` for rich) that doesn't exist in the table, causing DuckDB to reject it — the rejected event is dead-lettered to `wh.events_rejected` |
 

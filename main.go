@@ -997,6 +997,27 @@ func richMLDDLFor(mlCfg mlLabelsConfig) string {
 	return richMLDDL
 }
 
+// validatePartitionBy rejects specs that can't be a DuckLake partition list.
+// The spec is interpolated into DDL, so it must not carry a second statement.
+func validatePartitionBy(spec string) error {
+	if strings.TrimSpace(spec) == "" {
+		return fmt.Errorf("--partition-by must not be empty")
+	}
+	if strings.ContainsAny(spec, ";") {
+		return fmt.Errorf("--partition-by must be a comma-separated list of columns or transforms, got %q", spec)
+	}
+	return nil
+}
+
+// applyPartitioning sets the table's partition spec. DuckLake applies it to
+// data written from here on; existing Parquet files keep their layout.
+func applyPartitioning(db *sql.DB, fqt, spec string) error {
+	if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s SET PARTITIONED BY (%s)", fqt, spec)); err != nil {
+		return fmt.Errorf("set partitioning %q: %w", spec, err)
+	}
+	return nil
+}
+
 // pgRichMLDDLFor is the postgres-sink counterpart of richMLDDLFor.
 func pgRichMLDDLFor(mlCfg mlLabelsConfig) string {
 	ddl := `CREATE TABLE IF NOT EXISTS %s (
@@ -1205,6 +1226,7 @@ func runBatchMode(
 	hotspotDays int,
 	numUsers int,
 	mlCfg mlLabelsConfig,
+	partitionBy string,
 	sigCh chan os.Signal,
 ) error {
 	fqt := catalogName + "." + table
@@ -1217,6 +1239,11 @@ func runBatchMode(
 	}
 	if _, err := db.Exec(fmt.Sprintf(ddl, fqt)); err != nil {
 		return fmt.Errorf("create table: %w", err)
+	}
+	if partitionBy != "" {
+		if err := applyPartitioning(db, fqt, partitionBy); err != nil {
+			return err
+		}
 	}
 
 	sqlGen := batchSQLSimple
@@ -1805,6 +1832,7 @@ func main() {
 		numUsers           int
 		mlLabels           bool
 		conversionRate     float64
+		partitionBy        string
 	)
 
 	rootCmd := &cobra.Command{
@@ -1936,6 +1964,17 @@ Modes:
 			if schemaDriftRate < 0 || schemaDriftRate > 1 {
 				return fmt.Errorf("--schema-drift-rate must be between 0.0 and 1.0, got %.2f", schemaDriftRate)
 			}
+			if cmd.Flags().Changed("partition-by") {
+				if err := validatePartitionBy(partitionBy); err != nil {
+					return err
+				}
+				if runMode != "batch" {
+					return fmt.Errorf("--partition-by is only supported with --run-mode batch")
+				}
+				if runConn.isPostgresSink() {
+					return fmt.Errorf("--partition-by applies to DuckLake tables, not --data-sink postgres")
+				}
+			}
 			if err := resolvePgDSN(cmd, &runConn); err != nil {
 				return err
 			}
@@ -1965,6 +2004,9 @@ Modes:
 			fmt.Printf("  Distribution : %s%s%s\n", green, distribution, reset)
 			if distribution == "hotspot" {
 				fmt.Printf("  Hotspot span : %s%d days%s\n", green, hotspotDays, reset)
+			}
+			if partitionBy != "" {
+				fmt.Printf("  Partition by : %s%s%s\n", green, partitionBy, reset)
 			}
 
 			if runMode == "batch" {
@@ -2054,11 +2096,12 @@ Modes:
 			if runMode == "ticker" {
 				return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, numUsers, mlCfg, sigCh)
 			}
-			return runBatchMode(db, runConn.CatalogName, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, checkpointInterval, distribution, hotspotDays, numUsers, mlCfg, sigCh)
+			return runBatchMode(db, runConn.CatalogName, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, checkpointInterval, distribution, hotspotDays, numUsers, mlCfg, partitionBy, sigCh)
 		},
 	}
 
 	registerConnectionFlags(runCmd, &runConn)
+	runCmd.Flags().StringVar(&partitionBy, "partition-by", "", "Partition the table's future writes (batch mode, DuckLake only), e.g. \"day(ts)\", \"year(ts), month(ts)\", \"user_id\", or \"bucket(8, user_id)\"; runs ALTER TABLE ... SET PARTITIONED BY and does not rewrite existing files")
 	runCmd.Flags().StringVarP(&table, "table", "t", "", "Target table (defaults to 'events', 'events_rich', or 'events_rich_ml')")
 	runCmd.Flags().StringVarP(&schemaMode, "mode", "m", "simple", "Schema mode: simple, rich, or rich_ml (ML-optimized with enriched features)")
 	runCmd.Flags().IntVar(&numUsers, "num-users", 100, "Number of distinct users for rich_ml mode (required for rich_ml, ignored for other modes)")
