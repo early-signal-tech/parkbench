@@ -238,6 +238,16 @@ parkbench run --ducklake-secret ducklake_prod --num-batches 0
 | `--batch-size`, `-b` | `100000` | Rows per batch (batch mode only) |
 | `--num-batches`, `-n` | `10` | Number of batches; `0` = run forever |
 | `--flush-interval`, `-k` | `10` | Flush inlined rows to Parquet every N batches (batch mode) or at end if inlined rows > N (ticker mode); `0` = never |
+| `--ml-labels` | `false` | Add an `is_converted BOOLEAN` label column to `rich_ml` events; omitted entirely when unset |
+| `--conversion-rate` | `0.15` | Probability (0.0–1.0) that `is_converted` is true (requires `--ml-labels`) |
+| `--num-users` | `100` | Number of distinct users for `rich_ml` mode; ignored for other modes |
+| `--distribution` | `uniform` | Timestamp distribution: `uniform` (past 24h), `hotspot` (70% in last 6h, 30% spread), `yesterday` (previous day only), or `last_week` (past 7 days) |
+| `--hotspot-days` | `30` | Days to spread the 30% tail in `hotspot` distribution |
+| `--batch-size-min` / `--batch-size-max` | _(none)_ | Randomize each batch's size in `[min, max]` (batch mode only); overrides `--batch-size` when both are set |
+| `--partition-by` | _(none)_ | Partition the table's future writes (batch mode, DuckLake only), e.g. `"day(ts)"`, `"year(ts), month(ts)"`, `"user_id"`, or `"bucket(8, user_id)"`. Runs `ALTER TABLE ... SET PARTITIONED BY`; existing files are not rewritten |
+| `--data-sink` | `ducklake` | Write target: `ducklake`, or `postgres` to write directly to a Postgres table (ELT source data) |
+| `--postgres-schema` | _(none)_ | Postgres schema for source tables when `--data-sink postgres` (defaults to `public`) |
+| `--pg-dsn-file` | _(none)_ | Path to a file containing the Postgres DSN, keeping credentials out of shell history; mutually exclusive with `--pg-dsn` |
 | `--duration`, `-d` | `60` | Duration in seconds (ticker mode only) |
 | `--duplicate-rate` | `0.0` | Probability (0.0–1.0) of injecting a duplicate row each tick (ticker mode only) |
 | `--schema-drift-rate` | `0.0` | Probability (0.0–1.0) of injecting a schema-breaking row each tick (ticker mode only) |
