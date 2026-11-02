@@ -153,6 +153,7 @@ Inserts rows continuously and prints throughput stats.
 | `--data-path` | `./ducklake_data` | Parquet data directory: a local directory, or an `s3://bucket/prefix` URI |
 | `--s3-key-id` / `--s3-secret-key` / `--s3-region` | _(none)_ | S3 credentials, used only when `--data-path` is `s3://...`; fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` |
 | `--mode`, `-m` | `simple` | Schema mode: `simple`, `rich`, or `rich_ml` (ML-optimized) |
+| `--migrate` | `false` | Upgrade an older catalog to this build's DuckLake spec on attach (adds `AUTOMATIC_MIGRATION TRUE`); off by default so shared catalogs are never upgraded silently |
 | `--num-users` | `100` | Number of distinct users for `rich_ml` mode (configurable user profiles with realistic behavior patterns); ignored for `simple` and `rich` modes |
 | `--ml-labels` | `false` | Add an `is_converted BOOLEAN` label column to `rich_ml` events; when unset the column is absent from both the DDL and every insert. Requires `--mode rich_ml` |
 | `--conversion-rate` | `0.15` | Probability (0.0–1.0) that `is_converted` is true; requires `--ml-labels` |
@@ -178,6 +179,8 @@ id INTEGER, ts TIMESTAMP, event_type VARCHAR
 ```sql
 id INTEGER, user_id VARCHAR, event_type VARCHAR, ts TIMESTAMP, payload JSON, metadata JSON
 ```
+
+**rich with `--payload-type variant`** — `wh.events_rich_variant`: same columns, with `payload` and `metadata` as `VARIANT`. `rich_ml` likewise becomes `events_rich_ml_variant`, with `user_attributes` as `VARIANT`. Only the DuckLake sink supports it; `--data-sink postgres` and `--mode simple` are rejected.
 
 **rich_ml** — `wh.events_rich_ml` (ML-optimized with enriched features and user profiles)
 ```sql
@@ -304,7 +307,7 @@ duckdb
 INSTALL ducklake;
 LOAD ducklake;
 ATTACH 'ducklake:postgres:dbname=ducklake_v1 host=localhost' AS wh
-    (DATA_PATH './ducklake_data', AUTOMATIC_MIGRATION TRUE);
+    (DATA_PATH './ducklake_data');
 
 SELECT COUNT(*) FROM wh.events;
 SELECT * FROM wh.events LIMIT 10;
@@ -315,7 +318,7 @@ SELECT * FROM ducklake_settings('wh');
 If parkbench was run with `--ducklake-secret <name>`, there's no working-directory dependency — the secret bundles `DATA_PATH` and the metadata connection, so you can attach from anywhere:
 
 ```sql
-ATTACH 'ducklake:ducklake_prod' AS wh (AUTOMATIC_MIGRATION TRUE);
+ATTACH 'ducklake:ducklake_prod' AS wh;
 SELECT COUNT(*) FROM wh.events;
 ```
 
@@ -334,14 +337,14 @@ You have two options:
 
 ```sql
 ATTACH 'ducklake:postgres:dbname=ducklake_v1 host=localhost' AS wh
-    (DATA_PATH '/absolute/path/to/ducklake_data', AUTOMATIC_MIGRATION TRUE);
+    (DATA_PATH '/absolute/path/to/ducklake_data');
 ```
 
 **Option 2: Override the stored DATA_PATH (quick fix)**
 
 ```sql
 ATTACH 'ducklake:postgres:dbname=ducklake_v1 host=localhost' AS wh
-    (DATA_PATH './ducklake_data', AUTOMATIC_MIGRATION TRUE, OVERRIDE_DATA_PATH TRUE);
+    (DATA_PATH './ducklake_data', OVERRIDE_DATA_PATH TRUE);
 ```
 
 Use Option 1 if you're querying from the location where the data was written. Use Option 2 if you want to query from a different directory or with a different path.
