@@ -1150,6 +1150,9 @@ func runSetup(cfg ConnectionConfig) error {
 
 	rule("DuckLake Setup Complete")
 	printConnectionSummary(cfg)
+	if v, err := catalogVersion(db, cfg); err == nil {
+		fmt.Printf("  DuckLake spec: %s%s%s\n", green, v, reset)
+	}
 	fmt.Printf("  Tables       : %s%s.events, %s.events_rich, %s.%s%s\n",
 		green, cfg.CatalogName, cfg.CatalogName, cfg.CatalogName, rejectedEventsTable, reset)
 	fmt.Println()
@@ -2076,6 +2079,11 @@ Modes:
 				return err
 			}
 			defer db.Close()
+			if !runConn.isPostgresSink() {
+				if v, err := catalogVersion(db, runConn); err == nil {
+					fmt.Printf("  DuckLake spec: %s%s%s\n\n", green, v, reset)
+				}
+			}
 
 			// ── signal handling ─────────────────────────────────────────────
 			sigCh := make(chan os.Signal, 1)

@@ -62,6 +62,12 @@ type ConnectionConfig struct {
 	S3KeyID     string
 	S3SecretKey string
 	S3Region    string
+
+	// Migrate: pass AUTOMATIC_MIGRATION TRUE on ATTACH, upgrading an older
+	// catalog to the DuckLake spec version of the embedded DuckDB. Off by
+	// default so pointing parkbench at a shared catalog (e.g. prod) never
+	// silently upgrades it — older DuckLake clients may not read it afterward.
+	Migrate bool
 }
 
 func (c ConnectionConfig) isPostgresSink() bool {
@@ -133,6 +139,38 @@ func joinAttachOptions(opts ...string) string {
 	return strings.Join(nonEmpty, ", ")
 }
 
+func (c ConnectionConfig) migrationOption() string {
+	if c.Migrate {
+		return "AUTOMATIC_MIGRATION TRUE"
+	}
+	return ""
+}
+
+// metadataCatalog returns the DuckDB catalog name DuckLake exposes its
+// metadata tables under: METADATA_CATALOG if set, else DuckLake's default.
+func (c ConnectionConfig) metadataCatalog() string {
+	if c.MetadataCatalogName != "" {
+		return c.MetadataCatalogName
+	}
+	return "__ducklake_metadata_" + c.CatalogName
+}
+
+// catalogVersion reads the DuckLake spec version recorded in the attached
+// catalog's metadata (e.g. "1.0", "1.1").
+func catalogVersion(db *sql.DB, c ConnectionConfig) (string, error) {
+	var v string
+	q := fmt.Sprintf("SELECT value FROM %s.ducklake_metadata WHERE key = 'version'",
+		quoteIdent(c.metadataCatalog()))
+	if err := db.QueryRow(q).Scan(&v); err != nil {
+		return "", fmt.Errorf("read catalog version: %w", err)
+	}
+	return v, nil
+}
+
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
 // buildAttachSQL returns the ATTACH statement for this connection. Callers
 // must run any prerequisite statements (extension loads, ephemeral secrets)
 // via prepareConnection first.
@@ -140,7 +178,7 @@ func (c ConnectionConfig) buildAttachSQL() string {
 	if c.DucklakeSecret != "" {
 		return fmt.Sprintf("ATTACH 'ducklake:%s' AS %s (%s)", c.DucklakeSecret, c.CatalogName,
 			joinAttachOptions(
-				"AUTOMATIC_MIGRATION TRUE",
+				c.migrationOption(),
 				attachOption("METADATA_CATALOG", c.MetadataCatalogName),
 			))
 	}
@@ -155,14 +193,14 @@ func (c ConnectionConfig) buildAttachSQL() string {
 		return fmt.Sprintf("ATTACH 'ducklake:duckdb:%s' AS %s (%s)", catalogFile, c.CatalogName,
 			joinAttachOptions(
 				attachOption("DATA_PATH", dataPath),
-				"AUTOMATIC_MIGRATION TRUE",
+				c.migrationOption(),
 			))
 	}
 
 	return fmt.Sprintf("ATTACH 'ducklake:postgres:%s' AS %s (%s)", c.PgDSN, c.CatalogName,
 		joinAttachOptions(
 			attachOption("DATA_PATH", dataPath),
-			"AUTOMATIC_MIGRATION TRUE",
+			c.migrationOption(),
 			attachOption("METADATA_SCHEMA", c.MetadataSchema),
 			attachOption("METADATA_CATALOG", c.MetadataCatalogName),
 		))
@@ -278,6 +316,7 @@ func registerConnectionFlags(cmd *cobra.Command, cfg *ConnectionConfig) {
 	cmd.Flags().StringVar(&cfg.DataPath, "data-path", "./ducklake_data", "Where Parquet data files are stored: a local directory, or an s3://bucket/prefix URI")
 	cmd.Flags().StringVar(&cfg.S3KeyID, "s3-key-id", "", "AWS access key ID, used only when --data-path is an s3:// URI (falls back to AWS_ACCESS_KEY_ID)")
 	cmd.Flags().StringVar(&cfg.S3SecretKey, "s3-secret-key", "", "AWS secret access key, used only when --data-path is an s3:// URI (falls back to AWS_SECRET_ACCESS_KEY)")
+	cmd.Flags().BoolVar(&cfg.Migrate, "migrate", false, "Upgrade an older DuckLake catalog to this parkbench's spec version on attach (AUTOMATIC_MIGRATION); off by default so shared catalogs are never upgraded silently")
 	cmd.Flags().StringVar(&cfg.S3Region, "s3-region", "", "AWS region for the S3 bucket, used only when --data-path is an s3:// URI (falls back to AWS_REGION)")
 }
 
