@@ -26,15 +26,21 @@ The tool uses DuckDB in-process (not a DuckDB server). Each command opens an in-
 ```sql
 -- inline, local postgres (default)
 ATTACH 'ducklake:postgres:dbname=ducklake_v1 host=localhost' AS wh
-    (DATA_PATH './ducklake_data', AUTOMATIC_MIGRATION TRUE)
+    (DATA_PATH './ducklake_data')
 
 -- inline, remote postgres + s3, scoped to a metadata schema
 ATTACH 'ducklake:postgres:host=db.xxxx.supabase.co port=5432 dbname=postgres user=postgres password=*** sslmode=require' AS wh
-    (DATA_PATH 's3://bucket/prefix', AUTOMATIC_MIGRATION TRUE, METADATA_SCHEMA 'ducklake_meta')
+    (DATA_PATH 's3://bucket/prefix', METADATA_SCHEMA 'ducklake_meta')
 
 -- named secret
-ATTACH 'ducklake:ducklake_prod' AS wh (AUTOMATIC_MIGRATION TRUE, METADATA_CATALOG 'ducklake_prod_meta')
+ATTACH 'ducklake:ducklake_prod' AS wh (METADATA_CATALOG 'ducklake_prod_meta')
 ```
+
+`AUTOMATIC_MIGRATION TRUE` is added only when `--migrate` is passed (`ConnectionConfig.Migrate`).
+
+### DuckLake spec version
+
+The DuckLake spec version of a new catalog is fixed by the embedded DuckDB's `ducklake` extension; there is no ATTACH option to pick it. parkbench embeds DuckDB 2.0 (`duckdb-go/v2 v2.20000.0`), so `setup` creates **DuckLake 1.1** catalogs. Older (1.0) catalogs still attach and stay on 1.0 unless `--migrate` is passed. Migration is deliberately opt-in: upgrading a shared catalog (e.g. prod) can lock out older DuckLake clients. `catalogVersion()` reads the version from `ducklake_metadata`; `setup` and `run` print it.
 
 ## DuckDB Secrets
 

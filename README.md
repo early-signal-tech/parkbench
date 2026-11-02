@@ -263,6 +263,16 @@ parkbench reset --ducklake-secret ducklake_prod --force   # drops tables only, l
 |------|---------|-------------|
 | `--force`, `-f` | `false` | Skip confirmation prompt |
 
+### DuckLake spec version & `--migrate`
+
+parkbench embeds DuckDB 2.0, so `setup` creates **DuckLake 1.1** catalogs, and `setup`/`run` print the catalog's spec version. Existing 1.0 catalogs keep working as-is. To upgrade one to 1.1, pass `--migrate` (works on `setup`, `run`, and `reset`):
+
+```bash
+parkbench run --ducklake-secret my_lake --migrate -n 1
+```
+
+Migration is off by default so parkbench never silently upgrades a shared catalog: once migrated, clients on DuckDB < 2.0 may no longer be able to attach it.
+
 ## Querying from DuckDB CLI
 
 Run `duckdb` from the same working directory used by `parkbench run`, then:
