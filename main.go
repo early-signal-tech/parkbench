@@ -997,6 +997,29 @@ func richMLDDLFor(mlCfg mlLabelsConfig) string {
 	return richMLDDL
 }
 
+// Payload column types for rich / rich_ml tables. "json" is the default;
+// "variant" stores payload, metadata, and user_attributes as DuckDB VARIANT,
+// which DuckLake 1.1 can inline into PostgreSQL (BYTEA) and SQLite (BLOB)
+// metadata catalogs as well as DuckDB ones.
+const (
+	payloadTypeJSON    = "json"
+	payloadTypeVariant = "variant"
+)
+
+// applyPayloadType rewrites rich-mode DDL and INSERT SQL for the chosen
+// payload type. The generators all emit JSON column types and "}::JSON"
+// struct casts, so VARIANT is a straight substitution of those two forms.
+func applyPayloadType(sql, payloadType string) string {
+	if payloadType != payloadTypeVariant {
+		return sql
+	}
+	sql = strings.ReplaceAll(sql, "}::JSON", "}::VARIANT")
+	for _, sep := range []string{",", "\n"} {
+		sql = strings.ReplaceAll(sql, " JSON"+sep, " VARIANT"+sep)
+	}
+	return sql
+}
+
 // validatePartitionBy rejects specs that can't be a DuckLake partition list.
 // The spec is interpolated into DDL, so it must not carry a second statement.
 func validatePartitionBy(spec string) error {
@@ -1230,6 +1253,7 @@ func runBatchMode(
 	numUsers int,
 	mlCfg mlLabelsConfig,
 	partitionBy string,
+	payloadType string,
 	sigCh chan os.Signal,
 ) error {
 	fqt := catalogName + "." + table
@@ -1240,7 +1264,7 @@ func runBatchMode(
 	} else if schemaMode == "rich_ml" {
 		ddl = richMLDDLFor(mlCfg)
 	}
-	if _, err := db.Exec(fmt.Sprintf(ddl, fqt)); err != nil {
+	if _, err := db.Exec(applyPayloadType(fmt.Sprintf(ddl, fqt), payloadType)); err != nil {
 		return fmt.Errorf("create table: %w", err)
 	}
 	if partitionBy != "" {
@@ -1256,6 +1280,12 @@ func runBatchMode(
 		// For rich_ml, we need a wrapper that accepts numUsers
 		sqlGen = func(fqt string, startID, batchSize int, dist string, hotspot int) string {
 			return batchSQLRichML(fqt, startID, batchSize, dist, hotspot, numUsers, mlCfg)
+		}
+	}
+	if payloadType == payloadTypeVariant {
+		baseGen := sqlGen
+		sqlGen = func(fqt string, startID, batchSize int, dist string, hotspot int) string {
+			return applyPayloadType(baseGen(fqt, startID, batchSize, dist, hotspot), payloadTypeVariant)
 		}
 	}
 
@@ -1354,6 +1384,7 @@ func runTickerMode(
 	schemaDriftRate float64,
 	numUsers int,
 	mlCfg mlLabelsConfig,
+	payloadType string,
 	sigCh chan os.Signal,
 ) error {
 	fqt := catalogName + "." + table
@@ -1364,7 +1395,7 @@ func runTickerMode(
 	} else if schemaMode == "rich_ml" {
 		ddl = richMLDDLFor(mlCfg)
 	}
-	if _, err := db.Exec(fmt.Sprintf(ddl, fqt)); err != nil {
+	if _, err := db.Exec(applyPayloadType(fmt.Sprintf(ddl, fqt), payloadType)); err != nil {
 		return fmt.Errorf("create table: %w", err)
 	}
 	if err := createRejectedEventsTable(db, catalogName); err != nil {
@@ -1442,6 +1473,8 @@ loop:
 				driftSQL = tickerSQLSimpleDrifted(fqt, id)
 				driftPayload = simpleDriftPayload(id)
 			}
+			query = applyPayloadType(query, payloadType)
+			driftSQL = applyPayloadType(driftSQL, payloadType)
 
 			if _, err := db.Exec(query); err != nil {
 				return fmt.Errorf("tick %d insert: %w", tickNum, err)
@@ -1836,6 +1869,7 @@ func main() {
 		mlLabels           bool
 		conversionRate     float64
 		partitionBy        string
+		payloadType        string
 	)
 
 	rootCmd := &cobra.Command{
@@ -1918,6 +1952,7 @@ Modes:
     rich     — {id, user_id, event_type, ts, payload JSON, metadata JSON}
     rich_ml  — {id, user_id, event_type, ts, payload JSON, metadata JSON, user_attributes JSON}
               (ML-optimized: enriched features, user profiles, realistic distributions)
+    With --payload-type variant, the JSON columns are VARIANT instead.
 
   Run modes (batch, ticker):
     batch   — Inserts large batches of rows (default)
@@ -1938,6 +1973,22 @@ Modes:
 					table = "events_rich"
 				default:
 					table = "events"
+				}
+				// Keep VARIANT tables separate from the JSON ones so the two
+				// payload types never share a table.
+				if payloadType == payloadTypeVariant && schemaMode != "simple" {
+					table += "_variant"
+				}
+			}
+			if payloadType != payloadTypeJSON && payloadType != payloadTypeVariant {
+				return fmt.Errorf("--payload-type must be 'json' or 'variant', got %q", payloadType)
+			}
+			if payloadType == payloadTypeVariant {
+				if schemaMode == "simple" {
+					return fmt.Errorf("--payload-type variant requires --mode rich or rich_ml (simple mode has no payload columns)")
+				}
+				if runConn.isPostgresSink() {
+					return fmt.Errorf("--payload-type variant is not supported with --data-sink postgres (Postgres has no VARIANT type)")
 				}
 			}
 			if schemaMode != "simple" && schemaMode != "rich" && schemaMode != "rich_ml" {
@@ -1994,6 +2045,9 @@ Modes:
 				fmt.Printf("  Table        : %s%s.%s%s\n", green, runConn.CatalogName, table, reset)
 			}
 			fmt.Printf("  Schema mode  : %s%s%s\n", green, schemaMode, reset)
+			if schemaMode != "simple" && !runConn.isPostgresSink() {
+				fmt.Printf("  Payload type : %s%s%s\n", green, strings.ToUpper(payloadType), reset)
+			}
 			if schemaMode == "rich_ml" {
 				fmt.Printf("  User pool    : %s%d%s users with ML profiles\n", green, numUsers, reset)
 				if mlLabels {
@@ -2102,14 +2156,15 @@ Modes:
 				return runBatchModePostgresSink(db, runConn, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, distribution, hotspotDays, numUsers, mlCfg, sigCh)
 			}
 			if runMode == "ticker" {
-				return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, numUsers, mlCfg, sigCh)
+				return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, numUsers, mlCfg, payloadType, sigCh)
 			}
-			return runBatchMode(db, runConn.CatalogName, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, checkpointInterval, distribution, hotspotDays, numUsers, mlCfg, partitionBy, sigCh)
+			return runBatchMode(db, runConn.CatalogName, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, checkpointInterval, distribution, hotspotDays, numUsers, mlCfg, partitionBy, payloadType, sigCh)
 		},
 	}
 
 	registerConnectionFlags(runCmd, &runConn)
 	runCmd.Flags().StringVar(&partitionBy, "partition-by", "", "Partition the table's future writes (batch mode, DuckLake only), e.g. \"day(ts)\", \"year(ts), month(ts)\", \"user_id\", or \"bucket(8, user_id)\"; runs ALTER TABLE ... SET PARTITIONED BY and does not rewrite existing files")
+	runCmd.Flags().StringVar(&payloadType, "payload-type", payloadTypeJSON, "Column type for rich/rich_ml payload, metadata, and user_attributes: 'json' or 'variant' (DuckLake only; default table gets a _variant suffix). VARIANT inlines into Postgres/SQLite catalogs as of DuckLake 1.1")
 	runCmd.Flags().StringVarP(&table, "table", "t", "", "Target table (defaults to 'events', 'events_rich', or 'events_rich_ml')")
 	runCmd.Flags().StringVarP(&schemaMode, "mode", "m", "simple", "Schema mode: simple, rich, or rich_ml (ML-optimized with enriched features)")
 	runCmd.Flags().IntVar(&numUsers, "num-users", 100, "Number of distinct users for rich_ml mode (required for rich_ml, ignored for other modes)")

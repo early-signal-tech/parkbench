@@ -157,6 +157,7 @@ Inserts rows continuously and prints throughput stats.
 | `--ml-labels` | `false` | Add an `is_converted BOOLEAN` label column to `rich_ml` events; when unset the column is absent from both the DDL and every insert. Requires `--mode rich_ml` |
 | `--conversion-rate` | `0.15` | Probability (0.0–1.0) that `is_converted` is true; requires `--ml-labels` |
 | `--run-mode`, `-r` | `batch` | Run mode: `batch` or `ticker` |
+| `--payload-type` | `json` | `json` or `variant`: column type for rich/rich_ml JSON columns. `variant` appends `_variant` to the default table name. DuckLake sink only |
 | `--table`, `-t` | _(auto)_ | Table name (defaults to `events`, `events_rich`, or `events_rich_ml` depending on schema mode) |
 | `--batch-size`, `-b` | `100000` | Rows per batch (batch mode only) |
 | `--num-batches`, `-n` | `10` | Number of batches; `0` = run forever |
@@ -209,6 +210,10 @@ SELECT COUNT(*) FROM wh.events_rich_ml WHERE is_converted;
 ```
 
 The column is opt-in. Without the flag it is absent from the `CREATE TABLE` and from every insert, so `events_rich_ml` keeps its seven-column shape. `--conversion-rate` controls the positive-class rate (default `0.15`, i.e. ~15% `true`), which is a realistic level of class imbalance for conversion modelling.
+
+### VARIANT payloads (`--payload-type variant`)
+
+The rich/rich_ml generators always emit `JSON` column types and `}::JSON` struct casts. `applyPayloadType()` rewrites both to `VARIANT` when the flag is set, covering the DDL, batch SQL and ticker SQL (including drift SQL). Any new rich-mode generator must keep using the `}::JSON` cast form so this substitution still applies. In a Postgres catalog, both JSON and VARIANT inline as `bytea`: JSON as UTF-8 text, VARIANT as the binary Parquet Variant encoding (DuckLake 1.1+).
 
 ### Schema evolution
 
