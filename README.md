@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/early-signal-tech/parkbench/main/in
 **Or with a specific version:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/early-signal-tech/parkbench/main/install.sh | bash -s v1.0.0
+curl -fsSL https://raw.githubusercontent.com/early-signal-tech/parkbench/main/install.sh | bash -s v1.2.63
 ```
 
 **Or to a custom location:**
@@ -35,19 +35,15 @@ The installer will:
 
 **macOS (Apple Silicon / ARM64):**
 ```bash
-curl -L https://github.com/early-signal-tech/parkbench/releases/download/v1.0.0/parkbench-darwin-arm64 | sudo install -m 755 /dev/stdin /usr/local/bin/parkbench
+curl -L https://github.com/early-signal-tech/parkbench/releases/latest/download/parkbench-darwin-arm64 | sudo install -m 755 /dev/stdin /usr/local/bin/parkbench
 parkbench --help
 ```
 
-**macOS (Intel / AMD64):**
-```bash
-curl -L https://github.com/early-signal-tech/parkbench/releases/download/v1.0.0/parkbench-darwin-amd64 | sudo install -m 755 /dev/stdin /usr/local/bin/parkbench
-parkbench --help
-```
+Releases currently ship only the macOS ARM64 and Windows AMD64 binaries. On Intel Macs, build from source with Go 1.24+.
 
 **Windows (AMD64) - PowerShell (Admin):**
 ```powershell
-$url = "https://github.com/early-signal-tech/parkbench/releases/download/v1.0.0/parkbench-windows-amd64.exe"
+$url = "https://github.com/early-signal-tech/parkbench/releases/latest/download/parkbench-windows-amd64.exe"
 $installPath = "$env:ProgramFiles\parkbench\parkbench.exe"
 New-Item -ItemType Directory -Force -Path "$env:ProgramFiles\parkbench" | Out-Null
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -234,12 +230,24 @@ parkbench run --ducklake-secret ducklake_prod --num-batches 0
 | `--metadata-schema` | _(none)_ | Postgres schema for DuckLake's metadata tables (`METADATA_SCHEMA`); defaults to `public` (postgres mode only) |
 | `--data-path` | `./ducklake_data` | Parquet data directory: a local directory, or an `s3://bucket/prefix` URI |
 | `--s3-key-id` / `--s3-secret-key` / `--s3-region` | _(none)_ | S3 credentials, used only when `--data-path` is `s3://...`; fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` |
-| `--mode`, `-m` | `simple` | Schema mode: `simple` or `rich` |
+| `--mode`, `-m` | `simple` | Schema mode: `simple`, `rich`, or `rich_ml` |
+| `--payload-type` | `json` | `json` or `variant`: column type for rich/rich_ml payload columns. `variant` (DuckLake sink only) writes to `*_variant` tables; see [Schema Modes](#schema-modes) |
+| `--migrate` | `false` | Upgrade an older catalog to this build's DuckLake spec on attach; off by default |
 | `--run-mode`, `-r` | `batch` | Run mode: `batch` or `ticker` |
-| `--table`, `-t` | _(auto)_ | Table name (defaults to `events` or `events_rich`) |
+| `--table`, `-t` | _(auto)_ | Table name (defaults to `events`, `events_rich`, `events_rich_ml`, or the `_variant` form) |
 | `--batch-size`, `-b` | `100000` | Rows per batch (batch mode only) |
 | `--num-batches`, `-n` | `10` | Number of batches; `0` = run forever |
 | `--flush-interval`, `-k` | `10` | Flush inlined rows to Parquet every N batches (batch mode) or at end if inlined rows > N (ticker mode); `0` = never |
+| `--ml-labels` | `false` | Add an `is_converted BOOLEAN` label column to `rich_ml` events; omitted entirely when unset |
+| `--conversion-rate` | `0.15` | Probability (0.0–1.0) that `is_converted` is true (requires `--ml-labels`) |
+| `--num-users` | `100` | Number of distinct users for `rich_ml` mode; ignored for other modes |
+| `--distribution` | `uniform` | Timestamp distribution: `uniform` (past 24h), `hotspot` (70% in last 6h, 30% spread), `yesterday` (previous day only), or `last_week` (past 7 days) |
+| `--hotspot-days` | `30` | Days to spread the 30% tail in `hotspot` distribution |
+| `--batch-size-min` / `--batch-size-max` | _(none)_ | Randomize each batch's size in `[min, max]` (batch mode only); overrides `--batch-size` when both are set |
+| `--partition-by` | _(none)_ | Partition the table's future writes (batch mode, DuckLake only), e.g. `"day(ts)"`, `"year(ts), month(ts)"`, `"user_id"`, or `"bucket(8, user_id)"`. Runs `ALTER TABLE ... SET PARTITIONED BY`; existing files are not rewritten |
+| `--data-sink` | `ducklake` | Write target: `ducklake`, or `postgres` to write directly to a Postgres table (ELT source data) |
+| `--postgres-schema` | _(none)_ | Postgres schema for source tables when `--data-sink postgres` (defaults to `public`) |
+| `--pg-dsn-file` | _(none)_ | Path to a file containing the Postgres DSN, keeping credentials out of shell history; mutually exclusive with `--pg-dsn` |
 | `--duration`, `-d` | `60` | Duration in seconds (ticker mode only) |
 | `--duplicate-rate` | `0.0` | Probability (0.0–1.0) of injecting a duplicate row each tick (ticker mode only) |
 | `--schema-drift-rate` | `0.0` | Probability (0.0–1.0) of injecting a schema-breaking row each tick (ticker mode only) |
@@ -286,7 +294,7 @@ Run `duckdb` from the same working directory used by `parkbench run`, then:
 INSTALL ducklake;
 LOAD ducklake;
 ATTACH 'ducklake:postgres:dbname=ducklake_v1 host=localhost' AS wh
-  (DATA_PATH './ducklake_data', AUTOMATIC_MIGRATION TRUE);
+  (DATA_PATH './ducklake_data');
 
 SELECT COUNT(*) FROM wh.events;
 SELECT * FROM wh.events LIMIT 10;
@@ -298,7 +306,7 @@ SELECT * FROM wh.events LIMIT 10;
 INSTALL ducklake;
 LOAD ducklake;
 ATTACH 'ducklake:duckdb:./ducklake_data/wh.ducklake' AS wh
-  (DATA_PATH './ducklake_data', AUTOMATIC_MIGRATION TRUE);
+  (DATA_PATH './ducklake_data');
 
 SELECT COUNT(*) FROM wh.events;
 SELECT * FROM wh.events LIMIT 10;
@@ -352,7 +360,7 @@ go build -o parkbench .
 ## Requirements
 
 - Go 1.24.0+
-- DuckDB via `github.com/duckdb/duckdb-go/v2`
+- DuckDB 2.0 via `github.com/duckdb/duckdb-go/v2` (v2.20000.0+), which creates DuckLake 1.1 catalogs
 - PostgreSQL (only for `--metadata-store postgres`)
 
 ## Development
