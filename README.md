@@ -212,6 +212,9 @@ parkbench run --run-mode ticker --duration 60 --duplicate-rate 0.15
 # Ticker mode with 20% schema drift
 parkbench run --run-mode ticker --duration 60 --schema-drift-rate 0.20
 
+# VARIANT payloads instead of JSON (writes to events_rich_variant)
+parkbench run --mode rich --payload-type variant
+
 # Run forever
 parkbench run --num-batches 0
 
@@ -323,6 +326,16 @@ id INTEGER, ts TIMESTAMP, event_type VARCHAR
 ```sql
 id INTEGER, user_id VARCHAR, event_type VARCHAR, ts TIMESTAMP, payload JSON, metadata JSON
 ```
+
+**VARIANT payloads** — `--payload-type variant` (rich / rich_ml only)
+
+Swaps the `JSON` columns (`payload`, `metadata`, `user_attributes`) for DuckDB `VARIANT` and writes to `events_rich_variant` / `events_rich_ml_variant` by default, so JSON and VARIANT data never share a table. As of DuckLake 1.1, VARIANT values inline into PostgreSQL (`BYTEA`) and SQLite (`BLOB`) catalogs using the Parquet Variant encoding. Ticker mode with `-k 0` keeps every row inlined:
+
+```bash
+parkbench run --mode rich --run-mode ticker --duration 30 -k 0 --payload-type variant
+```
+
+Not supported with `--data-sink postgres`, since Postgres has no VARIANT type.
 
 **rejected (dead letter)** — `wh.events_rejected`
 ```sql
