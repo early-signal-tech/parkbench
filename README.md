@@ -159,6 +159,21 @@ parkbench secrets list
 parkbench secrets drop <name>
 ```
 
+**Keeping credentials off the command line.** `secrets create` reads the values as one JSON object on stdin, so a password or key never appears in the process list or shell history. This is how another program (such as the PB-1 panel in Duck Harness) creates secrets:
+
+```bash
+parkbench secrets create --type postgres --name supabase_pg < pg.json   # {"host": "...", "password": "..."}
+parkbench secrets list --output jsonl                                   # one line per secret: name, type, provider, scope; never values
+```
+
+| `--type` | Fields (`*` required) |
+|----------|-----------------------|
+| `s3` | `key_id`\*, `secret`\*, `region`, `scope` |
+| `postgres` | `host`\*, `password`\*, `port` (5432), `database` (postgres), `user` (postgres) |
+| `ducklake` | `data_path`\*, `metadata_secret`\* (a Postgres secret's name), `metadata_schema` |
+
+An unknown or missing field is an error that names the field and never repeats a value. Secret names must be identifiers (letters, digits and `_`, not starting with a digit), for every `secrets` command.
+
 ## Commands
 
 ### `setup` — Initialize a DuckLake catalog

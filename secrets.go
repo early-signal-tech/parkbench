@@ -14,7 +14,9 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 )
@@ -25,6 +27,7 @@ func newSecretsCmd() *cobra.Command {
 		Short: "Create, list, and drop persistent DuckDB secrets for a DuckLake connection",
 	}
 
+	secretsCmd.AddCommand(newSecretsCreateCmd())
 	secretsCmd.AddCommand(newSecretsCreateS3Cmd())
 	secretsCmd.AddCommand(newSecretsCreatePostgresCmd())
 	secretsCmd.AddCommand(newSecretsCreateDucklakeCmd())
@@ -51,20 +54,7 @@ func newSecretsCreateS3Cmd() *cobra.Command {
 		Short: "Create a persistent S3 secret",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withDuckDB(func(db *sql.DB) error {
-				query := fmt.Sprintf(`CREATE OR REPLACE PERSISTENT SECRET %s (
-	TYPE s3,
-	PROVIDER config,
-	KEY_ID %s,
-	SECRET %s,
-	REGION %s
-)`, name, sqlStringLiteral(keyID), sqlStringLiteral(secretKey), sqlStringLiteral(region))
-				if _, err := db.Exec(query); err != nil {
-					return fmt.Errorf("create s3 secret: %w", err)
-				}
-				fmt.Printf("%s✓ Created persistent S3 secret %q%s\n", green, name, reset)
-				return nil
-			})
+			return createSecret("s3", name, map[string]string{"key_id": keyID, "secret": secretKey, "region": region})
 		},
 	}
 
@@ -88,20 +78,8 @@ func newSecretsCreatePostgresCmd() *cobra.Command {
 		Short: "Create a persistent Postgres secret (works for Supabase or any Postgres)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withDuckDB(func(db *sql.DB) error {
-				query := fmt.Sprintf(`CREATE OR REPLACE PERSISTENT SECRET %s (
-	TYPE POSTGRES,
-	HOST %s,
-	PORT %d,
-	DATABASE %s,
-	USER %s,
-	PASSWORD %s
-)`, name, sqlStringLiteral(host), port, sqlStringLiteral(database), sqlStringLiteral(user), sqlStringLiteral(password))
-				if _, err := db.Exec(query); err != nil {
-					return fmt.Errorf("create postgres secret: %w", err)
-				}
-				fmt.Printf("%s✓ Created persistent Postgres secret %q%s\n", green, name, reset)
-				return nil
+			return createSecret("postgres", name, map[string]string{
+				"host": host, "port": fmt.Sprint(port), "database": database, "user": user, "password": password,
 			})
 		},
 	}
@@ -136,26 +114,16 @@ attach with a single flag:
     --metadata-schema ducklake_meta`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return withDuckDB(func(db *sql.DB) error {
-				metaParams := fmt.Sprintf("MAP {'TYPE': 'POSTGRES', 'SECRET': %s", sqlStringLiteral(metadataSecret))
-				if metadataSchema != "" {
-					metaParams += fmt.Sprintf(", 'SCHEMA': %s", sqlStringLiteral(metadataSchema))
-				}
-				metaParams += "}"
-
-				query := fmt.Sprintf(`CREATE OR REPLACE PERSISTENT SECRET %s (
-	TYPE DUCKLAKE,
-	METADATA_PATH '',
-	DATA_PATH %s,
-	METADATA_PARAMETERS %s
-)`, name, sqlStringLiteral(dataPath), metaParams)
-				if _, err := db.Exec(query); err != nil {
-					return fmt.Errorf("create ducklake secret: %w", err)
-				}
-				fmt.Printf("%s✓ Created persistent DuckLake secret %q%s\n", green, name, reset)
-				fmt.Printf("  Use it with: %sparkbench run --ducklake-secret %s%s\n", dim, name, reset)
-				return nil
-			})
+			if err := checkSecretName("--metadata-secret", metadataSecret); err != nil {
+				return err
+			}
+			if err := createSecret("ducklake", name, map[string]string{
+				"data_path": dataPath, "metadata_secret": metadataSecret, "metadata_schema": metadataSchema,
+			}); err != nil {
+				return err
+			}
+			fmt.Printf("  Use it with: %sparkbench run --ducklake-secret %s%s\n", dim, name, reset)
+			return nil
 		},
 	}
 
@@ -170,11 +138,18 @@ attach with a single flag:
 }
 
 func newSecretsListCmd() *cobra.Command {
-	return &cobra.Command{
+	var output string
+	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List all persistent and temporary DuckDB secrets",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if output != outputText && output != outputJSONL {
+				return fmt.Errorf("--output must be 'text' or 'jsonl', got %q", output)
+			}
+			if output == outputJSONL {
+				return withDuckDB(listSecretsJSONL)
+			}
 			return withDuckDB(func(db *sql.DB) error {
 				rows, err := db.Query("SELECT * FROM duckdb_secrets()")
 				if err != nil {
@@ -185,6 +160,87 @@ func newSecretsListCmd() *cobra.Command {
 			})
 		},
 	}
+	cmd.Flags().StringVar(&output, "output", outputText, "Output format: 'text', or 'jsonl' for one JSON object per secret (name, type, provider, persistent, storage, scope; never its values)")
+	return cmd
+}
+
+// listSecretsJSONL writes one line per secret, naming its columns, so the values
+// (duckdb_secrets().secret_string) can't come along.
+func listSecretsJSONL(db *sql.DB) error {
+	rows, err := db.Query("SELECT name, type, provider, persistent, storage, scope FROM duckdb_secrets() ORDER BY name")
+	if err != nil {
+		return fmt.Errorf("list secrets: %w", err)
+	}
+	defer rows.Close()
+	enc := json.NewEncoder(os.Stdout)
+	for rows.Next() {
+		var name, typ, provider, storage string
+		var persistent bool
+		var scope []any
+		if err := rows.Scan(&name, &typ, &provider, &persistent, &storage, &scope); err != nil {
+			return err
+		}
+		scopes := make([]string, 0, len(scope))
+		for _, sc := range scope {
+			scopes = append(scopes, fmt.Sprint(sc))
+		}
+		if err := enc.Encode(map[string]any{
+			"name": name, "type": typ, "provider": provider, "persistent": persistent, "storage": storage, "scope": scopes,
+		}); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// createSecret runs the CREATE statement for a type's values, with any sensitive value
+// taken out of an error.
+func createSecret(typ, name string, values map[string]string) error {
+	query, err := createSecretSQL(typ, name, values)
+	if err != nil {
+		return err
+	}
+	return withDuckDB(func(db *sql.DB) error {
+		if _, err := db.Exec(query); err != nil {
+			return redactValues(fmt.Errorf("create %s secret: %w", typ, err), typ, values)
+		}
+		fmt.Printf("%s✓ Created persistent %s secret %q%s\n", green, typ, name, reset)
+		return nil
+	})
+}
+
+func newSecretsCreateCmd() *cobra.Command {
+	var typ, name string
+	cmd := &cobra.Command{
+		Use:   "create",
+		Short: "Create a persistent secret from values read as JSON on stdin",
+		Long: `Creates (or replaces) a persistent DuckDB secret, reading its values as one JSON
+object on stdin, so passwords and keys never appear on the command line:
+
+  echo '{"host": "db.xxxx.supabase.co", "password": "..."}' | parkbench secrets create --type postgres --name supabase_pg
+
+Fields by type:
+  s3        key_id*, secret*, region, scope
+  postgres  host*, password*, port (5432), database (postgres), user (postgres)
+  ducklake  data_path*, metadata_secret*, metadata_schema
+(* required). Errors name a field but never repeat a value.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := checkSecretName("--name", name); err != nil {
+				return err
+			}
+			values, err := readSecretValues(cmd.InOrStdin(), typ)
+			if err != nil {
+				return err
+			}
+			return createSecret(typ, name, values)
+		},
+	}
+	cmd.Flags().StringVar(&typ, "type", "", "Secret type: ducklake, postgres, or s3")
+	cmd.Flags().StringVar(&name, "name", "", "Name of the persistent secret")
+	cmd.MarkFlagRequired("type")
+	cmd.MarkFlagRequired("name")
+	return cmd
 }
 
 func newSecretsDropCmd() *cobra.Command {
@@ -194,6 +250,9 @@ func newSecretsDropCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
+			if err := checkSecretName("the secret's name", name); err != nil {
+				return err
+			}
 			return withDuckDB(func(db *sql.DB) error {
 				if _, err := db.Exec(fmt.Sprintf("DROP PERSISTENT SECRET IF EXISTS %s", name)); err != nil {
 					return fmt.Errorf("drop secret: %w", err)
