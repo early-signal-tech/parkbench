@@ -202,6 +202,12 @@ parkbench run --mode rich
 # Ticker mode (1 row/sec for 60s)
 parkbench run --run-mode ticker --duration 60
 
+# Ticker mode, 4 rows/sec
+parkbench run --run-mode ticker --duration 60 --tick-interval 0.25
+
+# JSON Lines events on stdout, for driving parkbench from another program
+parkbench run --num-batches 5 --output jsonl
+
 # Ticker mode with 15% duplicate injection
 parkbench run --run-mode ticker --duration 60 --duplicate-rate 0.15
 
@@ -249,8 +255,33 @@ parkbench run --ducklake-secret ducklake_prod --num-batches 0
 | `--postgres-schema` | _(none)_ | Postgres schema for source tables when `--data-sink postgres` (defaults to `public`) |
 | `--pg-dsn-file` | _(none)_ | Path to a file containing the Postgres DSN, keeping credentials out of shell history; mutually exclusive with `--pg-dsn` |
 | `--duration`, `-d` | `60` | Duration in seconds (ticker mode only) |
+| `--tick-interval` | `1` | Seconds between ticks, e.g. `0.5` or `2` (ticker mode only; minimum `0.01`) |
+| `--output` | `text` | `text`, or `jsonl` for one JSON event per line on stdout; see [Machine-readable output](#machine-readable-output---output-jsonl) |
 | `--duplicate-rate` | `0.0` | Probability (0.0–1.0) of injecting a duplicate row each tick (ticker mode only) |
 | `--schema-drift-rate` | `0.0` | Probability (0.0–1.0) of injecting a schema-breaking row each tick (ticker mode only) |
+
+### Machine-readable output (`--output jsonl`)
+
+With `--output jsonl`, stdout carries only JSON Lines, one event per line, so another program can follow a run step by step. The banner, warnings and progress text go to stderr. Events never include connection strings, credentials or row contents.
+
+| `event` | When | Fields |
+|---------|------|--------|
+| `batch` | after each batch (batch mode) | `batch`, `num_batches` (0 = forever), `rows`, `batch_secs`, `rows_total`, `elapsed_secs`, `rows_per_sec`, `table_rows` (DuckLake only) |
+| `tick` | after each tick (ticker mode) | `tick`, `rows` (1, or 2 with a duplicate), `duplicate`, `drift`, `rows_total`, `duplicates`, `drifts`, `elapsed_secs`, `rows_per_sec`, `table_rows` (DuckLake only) |
+| `drift` | a schema-drift insert was rejected; comes before that tick's `tick` event | `tick`, `id`, `error` |
+| `flush` | inlined rows flushed to Parquet (DuckLake only) | `secs`, plus `batch` (batch mode) or `rows` (ticker mode, end-of-run flush) |
+| `done` | the run ended; always the last line unless the run errored | `reason` (`complete`, `duration` or `interrupted`), `steps`, `rows_total`, `elapsed_secs`, `rows_per_sec`, `duplicates`, `drifts` |
+
+```bash
+parkbench run --run-mode ticker --tick-interval 0.5 --duration 30 --schema-drift-rate 0.1 --output jsonl
+```
+
+```json
+{"event":"tick","tick":1,"rows":1,"duplicate":false,"drift":false,"rows_total":1,"duplicates":0,"drifts":0,"elapsed_secs":0.5,"rows_per_sec":2,"table_rows":1}
+{"event":"done","reason":"duration","steps":60,"rows_total":60,"elapsed_secs":30,"rows_per_sec":2,"duplicates":0,"drifts":6}
+```
+
+A run that fails exits non-zero with `Error: ...` on stderr and no `done` event.
 
 ### `reset` — Drop and recreate the catalog
 

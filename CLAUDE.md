@@ -164,6 +164,8 @@ Inserts rows continuously and prints throughput stats.
 | `--num-batches`, `-n` | `10` | Number of batches; `0` = run forever |
 | `--flush-interval`, `-k` | `10` | Flush inlined rows to Parquet every N batches (batch mode) or at end if inlined rows > N (ticker mode); `0` = never |
 | `--duration`, `-d` | `60` | Duration in seconds (ticker mode only) |
+| `--tick-interval` | `1` | Seconds between ticks, as a float (ticker mode only; minimum `0.01`) |
+| `--output` | `text` | `text` or `jsonl`; see "Machine-readable output" below |
 | `--partition-by` | _(none)_ | Partition the table's future writes (batch mode, DuckLake only): a comma-separated list of columns or transforms (`year`, `month`, `day`, `hour`, `bucket(N, col)`), e.g. `"year(ts), month(ts), day(ts)"`. Runs `ALTER TABLE ... SET PARTITIONED BY (...)` after table creation; existing Parquet files are not rewritten. Pair with `--distribution last_week` or `hotspot` so batches span several partitions |
 | `--duplicate-rate` | `0.0` | Probability (0.0–1.0) of injecting a duplicate row on each tick (ticker mode only); e.g. `0.15` = ~15% duplicates |
 | `--schema-drift-rate` | `0.0` | Probability (0.0–1.0) of injecting a schema-breaking row on each tick (ticker mode only); the insert targets an unknown column (`event_category` for simple, `schema_version` for rich) that doesn't exist in the table, causing DuckDB to reject it — the rejected event is dead-lettered to `wh.events_rejected` |
@@ -274,7 +276,11 @@ SELECT * FROM wh.events_rejected ORDER BY rejected_at DESC LIMIT 10;
 
 **batch** — inserts `--batch-size` rows per iteration using a single `INSERT INTO ... SELECT range(N)` SQL statement. Fast bulk ingest. Calls `ducklake_flush_inlined_data()` every `--flush-interval` batches to materialize inlined rows into Parquet files.
 
-**ticker** — inserts one row per second via `time.NewTicker`. Simulates a low-volume real-time stream. At the end, if the number of new inlined rows exceeds `--flush-interval`, calls `ducklake_flush_inlined_data()` to write Parquet files.
+**ticker** — inserts one row per tick via `time.NewTicker(--tick-interval)` (default 1s). Simulates a low-volume real-time stream. At the end, if the number of new inlined rows exceeds `--flush-interval`, calls `ducklake_flush_inlined_data()` to write Parquet files.
+
+## Machine-readable output
+
+`run --output jsonl` writes JSON Lines events (`batch`, `tick`, `drift`, `flush`, `done`) to stdout; the event structs and the full contract live in `events.go`, and the README documents the fields. `enableJSONL()` keeps the real stdout for events and points `os.Stdout` at stderr, so every existing `fmt.Printf` goes to stderr without being rewritten. Any new run-loop output should either be human text (plain `fmt.Printf`) or an `emit(...)` call, and new loops must call `emitDone` before returning normally. Never put DSNs, secrets or row values in an event. The PB-1 panel in duck-harness-app consumes this stream via cli-bridge.
 
 ## DuckLake Inlining Behavior
 
