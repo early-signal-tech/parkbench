@@ -11,7 +11,7 @@
 // Run Modes:
 //
 //	batch  — Inserts large batches of rows (default)
-//	ticker — Inserts one row per second for a specified duration
+//	ticker — Inserts one row per tick (--tick-interval, default 1s) for a specified duration
 package main
 
 import (
@@ -1302,6 +1302,7 @@ func runBatchMode(
 		startTotal = time.Now()
 		flushInfo  string
 		batchNum   int
+		reason     = doneComplete
 	)
 
 	runForever := numBatches == 0
@@ -1311,6 +1312,7 @@ loop:
 		select {
 		case <-sigCh:
 			fmt.Printf("\n%sInterrupted by user.%s\n", yellow, reset)
+			reason = doneInterrupted
 			break loop
 		default:
 		}
@@ -1349,13 +1351,23 @@ loop:
 			f0 := time.Now()
 			if _, err := db.Exec(fmt.Sprintf("CALL ducklake_flush_inlined_data('%s')", catalogName)); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: flush failed: %v\n", err)
+			} else {
+				emit(flushEvent{Event: "flush", Batch: batchNum, Secs: time.Since(f0).Seconds()})
 			}
 			flushInfo = fmt.Sprintf("%.2fs", time.Since(f0).Seconds())
 		}
 
 		s := getStorageStats(db, catalogName, table)
-		printStats(batchNum, numBatches, currentBatchSize, batchSecs,
-			cumulative, elapsedTotal, s, flushInfo)
+		if jsonlEnabled() {
+			emit(batchEvent{
+				Event: "batch", Batch: batchNum, NumBatches: numBatches, Rows: currentBatchSize,
+				BatchSecs: batchSecs, RowsTotal: cumulative, ElapsedSecs: elapsedTotal,
+				RowsPerSec: rate(cumulative, elapsedTotal), TableRows: &s.total,
+			})
+		} else {
+			printStats(batchNum, numBatches, currentBatchSize, batchSecs,
+				cumulative, elapsedTotal, s, flushInfo)
+		}
 	}
 
 	elapsedTotal := time.Since(startTotal).Seconds()
@@ -1363,6 +1375,7 @@ loop:
 	if elapsedTotal > 0 {
 		overall = float64(cumulative) / elapsedTotal
 	}
+	emitDone(reason, batchNum, cumulative, elapsedTotal, 0, 0)
 	rule("")
 	fmt.Printf("%s%sDone.%s Inserted %s%s%s rows in %.2fs  (%s rows/sec overall)\n",
 		bold, green, reset,
@@ -1385,6 +1398,7 @@ func runTickerMode(
 	numUsers int,
 	mlCfg mlLabelsConfig,
 	payloadType string,
+	tickInterval time.Duration,
 	sigCh chan os.Signal,
 ) error {
 	fqt := catalogName + "." + table
@@ -1433,16 +1447,18 @@ func runTickerMode(
 		}
 	}
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 
 	durationTimer := time.After(time.Duration(duration) * time.Second)
+	reason := doneDuration
 
 loop:
 	for {
 		select {
 		case <-sigCh:
 			fmt.Printf("\n%sInterrupted by user.%s\n", yellow, reset)
+			reason = doneInterrupted
 			break loop
 		case <-durationTimer:
 			fmt.Printf("\n%sDuration complete.%s\n", yellow, reset)
@@ -1451,6 +1467,7 @@ loop:
 			tickNum++
 			id := nextID
 			nextID++
+			tickRows, duplicated, drifted := 1, false, false
 
 			var query string
 			var driftSQL string
@@ -1488,6 +1505,7 @@ loop:
 				} else {
 					dupCount++
 					cumulative++
+					tickRows, duplicated = 2, true
 				}
 			}
 
@@ -1498,7 +1516,12 @@ loop:
 			if schemaDriftRate > 0 && rand.Float64() < schemaDriftRate {
 				if _, err := db.Exec(driftSQL); err != nil {
 					driftCount++
-					fmt.Printf("\n%s⚠  Schema drift at tick %d:%s %v\n", red+bold, tickNum, reset, err)
+					drifted = true
+					if jsonlEnabled() {
+						emit(driftEvent{Event: "drift", Tick: tickNum, ID: id, Error: err.Error()})
+					} else {
+						fmt.Printf("\n%s⚠  Schema drift at tick %d:%s %v\n", red+bold, tickNum, reset, err)
+					}
 					if dlqErr := recordRejectedEvent(db, catalogName, table, "schema_drift", id, err, driftPayload); dlqErr != nil {
 						fmt.Fprintf(os.Stderr, "warning: failed to record rejected event at tick %d: %v\n", tickNum, dlqErr)
 					}
@@ -1508,7 +1531,15 @@ loop:
 			elapsedTotal := time.Since(startTotal).Seconds()
 
 			s := getStorageStats(db, catalogName, table)
-			printTickerStats(tickNum, 1.0, cumulative, elapsedTotal, s, dupCount, driftCount)
+			if jsonlEnabled() {
+				emit(tickEvent{
+					Event: "tick", Tick: tickNum, Rows: tickRows, Duplicate: duplicated, Drift: drifted,
+					RowsTotal: cumulative, Duplicates: dupCount, Drifts: driftCount,
+					ElapsedSecs: elapsedTotal, RowsPerSec: rate(cumulative, elapsedTotal), TableRows: &s.total,
+				})
+			} else {
+				printTickerStats(tickNum, tickInterval.Seconds(), cumulative, elapsedTotal, s, dupCount, driftCount)
+			}
 		}
 	}
 
@@ -1533,9 +1564,11 @@ loop:
 				dim, bold, s.total, reset,
 				bold, state.LastFlushedCount, reset, reset)
 
+			f0 := time.Now()
 			if _, err := db.Exec(fmt.Sprintf("CALL ducklake_flush_inlined_data('%s')", catalogName)); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: final flush failed: %v\n", err)
 			} else {
+				emit(flushEvent{Event: "flush", Rows: newRowsSinceFlush, Secs: time.Since(f0).Seconds()})
 				// Update state with new flushed count
 				state.LastFlushedCount = s.total
 				if err := saveState(catalogName, table, state); err != nil {
@@ -1551,6 +1584,7 @@ loop:
 		}
 	}
 
+	emitDone(reason, tickNum, cumulative, elapsedTotal, dupCount, driftCount)
 	rule("")
 	fmt.Printf("%s%sDone.%s Inserted %s%s%s rows in %.2fs  (%s rows/sec overall)\n",
 		bold, green, reset,
@@ -1638,6 +1672,7 @@ func runBatchModePostgresSink(
 		cumulative int64
 		startTotal = time.Now()
 		batchNum   int
+		reason     = doneComplete
 	)
 
 	runForever := numBatches == 0
@@ -1647,6 +1682,7 @@ loop:
 		select {
 		case <-sigCh:
 			fmt.Printf("\n%sInterrupted by user.%s\n", yellow, reset)
+			reason = doneInterrupted
 			break loop
 		default:
 		}
@@ -1680,8 +1716,17 @@ loop:
 
 		cumulative += int64(currentBatchSize)
 
-		// Simple status per batch (no metrics)
-		fmt.Printf("  Batch %d: %s rows in %.3fs\n", batchNum, commas(int64(currentBatchSize)), batchSecs)
+		if jsonlEnabled() {
+			elapsedTotal := time.Since(startTotal).Seconds()
+			emit(batchEvent{
+				Event: "batch", Batch: batchNum, NumBatches: numBatches, Rows: currentBatchSize,
+				BatchSecs: batchSecs, RowsTotal: cumulative, ElapsedSecs: elapsedTotal,
+				RowsPerSec: rate(cumulative, elapsedTotal),
+			})
+		} else {
+			// Simple status per batch (no metrics)
+			fmt.Printf("  Batch %d: %s rows in %.3fs\n", batchNum, commas(int64(currentBatchSize)), batchSecs)
+		}
 	}
 
 	elapsedTotal := time.Since(startTotal).Seconds()
@@ -1689,6 +1734,7 @@ loop:
 	if elapsedTotal > 0 {
 		overall = float64(cumulative) / elapsedTotal
 	}
+	emitDone(reason, batchNum, cumulative, elapsedTotal, 0, 0)
 	rule("")
 	fmt.Printf("%s%sDone.%s Inserted %s%s%s rows in %.2fs  (%s rows/sec overall)\n",
 		bold, green, reset,
@@ -1709,6 +1755,7 @@ func runTickerModePostgresSink(
 	schemaDriftRate float64,
 	numUsers int,
 	mlCfg mlLabelsConfig,
+	tickInterval time.Duration,
 	sigCh chan os.Signal,
 ) error {
 	// Use schema-qualified table name if schema is specified
@@ -1764,16 +1811,18 @@ func runTickerModePostgresSink(
 		}
 	}
 
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 
 	durationTimer := time.After(time.Duration(duration) * time.Second)
+	reason := doneDuration
 
 loop:
 	for {
 		select {
 		case <-sigCh:
 			fmt.Printf("\n%sInterrupted by user.%s\n", yellow, reset)
+			reason = doneInterrupted
 			break loop
 		case <-durationTimer:
 			fmt.Printf("\n%sDuration complete.%s\n", yellow, reset)
@@ -1782,6 +1831,7 @@ loop:
 			tickNum++
 			id := nextID
 			nextID++
+			tickRows, duplicated, drifted := 1, false, false
 
 			var query string
 			if schemaMode == "rich" {
@@ -1807,6 +1857,7 @@ loop:
 				} else {
 					dupCount++
 					cumulative++
+					tickRows, duplicated = 2, true
 				}
 			}
 
@@ -1816,12 +1867,23 @@ loop:
 			if schemaDriftRate > 0 && rand.Float64() < schemaDriftRate {
 				if _, err := db.Exec(tickerSQLDriftedPostgres(fqt, int(id), schemaMode)); err != nil {
 					driftCount++
-					fmt.Printf("\n%s⚠  Schema drift at tick %d:%s %v\n", red+bold, tickNum, reset, err)
+					drifted = true
+					if jsonlEnabled() {
+						emit(driftEvent{Event: "drift", Tick: tickNum, ID: int(id), Error: err.Error()})
+					} else {
+						fmt.Printf("\n%s⚠  Schema drift at tick %d:%s %v\n", red+bold, tickNum, reset, err)
+					}
 				}
 			}
 
 			elapsedTotal := time.Since(startTotal).Seconds()
-			if tickNum%10 == 0 {
+			if jsonlEnabled() {
+				emit(tickEvent{
+					Event: "tick", Tick: tickNum, Rows: tickRows, Duplicate: duplicated, Drift: drifted,
+					RowsTotal: cumulative, Duplicates: dupCount, Drifts: driftCount,
+					ElapsedSecs: elapsedTotal, RowsPerSec: rate(cumulative, elapsedTotal),
+				})
+			} else if tickNum%10 == 0 {
 				fmt.Printf("  Tick %d: %s rows inserted so far in %.1fs\n", tickNum, commas(cumulative), elapsedTotal)
 			}
 		}
@@ -1832,6 +1894,7 @@ loop:
 	if elapsedTotal > 0 {
 		overall = float64(cumulative) / elapsedTotal
 	}
+	emitDone(reason, tickNum, cumulative, elapsedTotal, dupCount, driftCount)
 	rule("")
 	fmt.Printf("%s%sDone.%s Inserted %s%s%s rows in %.2fs  (%s rows/sec overall)\n",
 		bold, green, reset,
@@ -1870,6 +1933,8 @@ func main() {
 		conversionRate     float64
 		partitionBy        string
 		payloadType        string
+		outputFormat       string
+		tickIntervalSecs   float64
 	)
 
 	rootCmd := &cobra.Command{
@@ -1956,7 +2021,7 @@ Modes:
 
   Run modes (batch, ticker):
     batch   — Inserts large batches of rows (default)
-    ticker  — Inserts one row per second for a specified duration`,
+    ticker  — Inserts one row per tick (--tick-interval, default 1s) for a specified duration`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if table == "" {
@@ -2006,6 +2071,13 @@ Modes:
 			if runMode != "batch" && runMode != "ticker" {
 				return fmt.Errorf("--run-mode must be 'batch' or 'ticker', got %q", runMode)
 			}
+			if outputFormat != outputText && outputFormat != outputJSONL {
+				return fmt.Errorf("--output must be 'text' or 'jsonl', got %q", outputFormat)
+			}
+			tickInterval, err := tickIntervalFrom(tickIntervalSecs)
+			if err != nil {
+				return err
+			}
 			if runConn.DucklakeSecret == "" && runConn.MetadataStore != "postgres" && runConn.MetadataStore != "duckdb" {
 				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", runConn.MetadataStore)
 			}
@@ -2031,6 +2103,9 @@ Modes:
 			}
 			if err := resolvePgDSN(cmd, &runConn); err != nil {
 				return err
+			}
+			if outputFormat == outputJSONL {
+				enableJSONL()
 			}
 
 			// ── banner ──────────────────────────────────────────────────────
@@ -2101,6 +2176,7 @@ Modes:
 				}
 			} else if runMode == "ticker" {
 				fmt.Printf("  Duration     : %s%d%s seconds\n", green, duration, reset)
+				fmt.Printf("  Tick         : every %s%gs%s\n", green, tickInterval.Seconds(), reset)
 				if !postgresSink {
 					if checkpointInterval == 0 {
 						fmt.Printf("  Flush        : %sdisabled%s (no flush at end)\n", green, reset)
@@ -2123,7 +2199,6 @@ Modes:
 
 			// ── open connection ─────────────────────────────────────────────
 			var db *sql.DB
-			var err error
 			if runConn.isPostgresSink() {
 				db, err = openPostgres(runConn)
 			} else {
@@ -2151,12 +2226,12 @@ Modes:
 			// ── run selected mode ───────────────────────────────────────────
 			if runConn.isPostgresSink() {
 				if runMode == "ticker" {
-					return runTickerModePostgresSink(db, runConn, table, schemaMode, duration, duplicateRate, schemaDriftRate, numUsers, mlCfg, sigCh)
+					return runTickerModePostgresSink(db, runConn, table, schemaMode, duration, duplicateRate, schemaDriftRate, numUsers, mlCfg, tickInterval, sigCh)
 				}
 				return runBatchModePostgresSink(db, runConn, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, distribution, hotspotDays, numUsers, mlCfg, sigCh)
 			}
 			if runMode == "ticker" {
-				return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, numUsers, mlCfg, payloadType, sigCh)
+				return runTickerMode(db, runConn.CatalogName, table, schemaMode, duration, checkpointInterval, duplicateRate, schemaDriftRate, numUsers, mlCfg, payloadType, tickInterval, sigCh)
 			}
 			return runBatchMode(db, runConn.CatalogName, table, schemaMode, batchSize, batchSizeMin, batchSizeMax, numBatches, checkpointInterval, distribution, hotspotDays, numUsers, mlCfg, partitionBy, payloadType, sigCh)
 		},
@@ -2179,6 +2254,8 @@ Modes:
 	runCmd.Flags().IntVarP(&numBatches, "num-batches", "n", 10, "Number of batches (batch mode only, 0 = forever)")
 	runCmd.Flags().IntVarP(&checkpointInterval, "flush-interval", "k", 10, "Flush inlined rows to Parquet every N batches, or at end if inlined rows > N (0 = never)")
 	runCmd.Flags().IntVarP(&duration, "duration", "d", 60, "Duration in seconds (ticker mode only)")
+	runCmd.Flags().Float64Var(&tickIntervalSecs, "tick-interval", 1.0, "Seconds between ticks, e.g. 0.5 or 2 (ticker mode only; minimum 0.01)")
+	runCmd.Flags().StringVar(&outputFormat, "output", outputText, "Output format: 'text' (human-readable) or 'jsonl' (one JSON event per line on stdout; everything else goes to stderr)")
 	runCmd.Flags().Float64Var(&duplicateRate, "duplicate-rate", 0.0, "Probability (0.0–1.0) of injecting a duplicate row each tick (ticker mode only)")
 	runCmd.Flags().Float64Var(&schemaDriftRate, "schema-drift-rate", 0.0, "Probability (0.0–1.0) of injecting a schema-breaking row each tick (ticker mode only); the insert targets an unknown column and is rejected, simulating a source schema change")
 
