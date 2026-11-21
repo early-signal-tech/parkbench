@@ -52,7 +52,13 @@ Parkbench can create and consume DuckDB's persistent secrets (`CREATE PERSISTENT
 ./parkbench secrets create-ducklake --name ducklake_prod --data-path s3://bucket/prefix --metadata-secret supabase_pg --metadata-schema ducklake_meta
 ./parkbench secrets list
 ./parkbench secrets drop <name>
+
+# values as JSON on stdin, so they never appear on a command line (used by cli-bridge / PB-1)
+./parkbench secrets create --type postgres --name supabase_pg < values.json
+./parkbench secrets list --output jsonl
 ```
+
+`secrets create` and the JSON parsing, SQL building and error redaction live in `secrets_input.go` (`secretTypes` lists each type's fields and which are sensitive); the `create-*` flag commands build their SQL through the same `createSecretSQL`. A secret name goes into SQL unquoted, so every command checks it with `checkSecretName`. Errors must name a field, never a value; DuckDB errors pass through `redactValues`. `list --output jsonl` selects named columns from `duckdb_secrets()`, so `secret_string` can't leak.
 
 These are implemented in `secrets.go` and just execute the literal `CREATE PERSISTENT SECRET`/`DROP PERSISTENT SECRET` SQL via an ephemeral DuckDB connection — persistent secrets live in DuckDB's local secret store regardless of parkbench's process, so they're also visible/manageable from the plain `duckdb` CLI (`FROM duckdb_secrets();`).
 
