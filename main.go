@@ -1963,8 +1963,8 @@ If using a local Postgres metadata store, the database must already exist:
   psql -d postgres -c "CREATE DATABASE ducklake_v1;"`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if setupConn.DucklakeSecret == "" && setupConn.MetadataStore != "postgres" && setupConn.MetadataStore != "duckdb" {
-				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", setupConn.MetadataStore)
+			if err := checkMetadataStore(setupConn); err != nil {
+				return err
 			}
 			if err := resolvePgDSN(cmd, &setupConn); err != nil {
 				return err
@@ -1990,8 +1990,8 @@ that shared infrastructure outright. Either way, re-runs setup afterward.
 Prompts for confirmation unless --force is set.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if resetConn.DucklakeSecret == "" && resetConn.MetadataStore != "postgres" && resetConn.MetadataStore != "duckdb" {
-				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", resetConn.MetadataStore)
+			if err := checkMetadataStore(resetConn); err != nil {
+				return err
 			}
 			if err := resolvePgDSN(cmd, &resetConn); err != nil {
 				return err
@@ -2078,8 +2078,8 @@ Modes:
 			if err != nil {
 				return err
 			}
-			if runConn.DucklakeSecret == "" && runConn.MetadataStore != "postgres" && runConn.MetadataStore != "duckdb" {
-				return fmt.Errorf("--metadata-store must be 'postgres' or 'duckdb', got %q", runConn.MetadataStore)
+			if err := checkMetadataStore(runConn); err != nil {
+				return err
 			}
 			if distribution != "uniform" && distribution != "hotspot" && distribution != "yesterday" && distribution != "last_week" {
 				return fmt.Errorf("--distribution must be 'uniform', 'hotspot', 'yesterday', or 'last_week', got %q", distribution)
@@ -2265,6 +2265,7 @@ Modes:
 	rootCmd.AddCommand(resetCmd)
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(newSecretsCmd())
+	rootCmd.AddCommand(newQuackServeCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

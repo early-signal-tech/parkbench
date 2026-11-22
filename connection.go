@@ -11,6 +11,8 @@
 //     .ducklake file plus a local data directory. Zero-config local dev.
 //  3. Inline Postgres catalog (MetadataStore == "postgres") — any Postgres,
 //     local or remote (e.g. Supabase), writing data locally or to S3.
+//  4. A local DuckDB catalog through a Quack server (MetadataStore == "quack"),
+//     so several programs can use it at once. See quack.go.
 package main
 
 import (
@@ -46,8 +48,10 @@ type ConnectionConfig struct {
 	MetadataCatalogName string
 
 	// Inline mode.
-	MetadataStore string // "postgres" | "duckdb"
-	PgDSN         string
+	MetadataStore string // "postgres" | "duckdb" | "quack"
+	// QuackURI: the local Quack server serving the catalog (MetadataStore "quack").
+	QuackURI string
+	PgDSN    string
 	// PgDSNFile: path to a file holding the DSN, so credentials stay out of
 	// shell history and process listings. Read into PgDSN by resolvePgDSN.
 	PgDSNFile string
@@ -188,6 +192,14 @@ func (c ConnectionConfig) buildAttachSQL() string {
 		dataPath = "."
 	}
 
+	if c.MetadataStore == "quack" {
+		return fmt.Sprintf("ATTACH 'ducklake:%s' AS %s (%s)", c.QuackURI, c.CatalogName,
+			joinAttachOptions(
+				attachOption("DATA_PATH", dataPath),
+				c.migrationOption(),
+			))
+	}
+
 	if c.MetadataStore == "duckdb" {
 		catalogFile := filepath.Join(dataPath, c.CatalogName+".ducklake")
 		return fmt.Sprintf("ATTACH 'ducklake:duckdb:%s' AS %s (%s)", catalogFile, c.CatalogName,
@@ -212,6 +224,9 @@ func (c ConnectionConfig) buildAttachSQL() string {
 func (c ConnectionConfig) prepareConnection(db *sql.DB) error {
 	if c.DucklakeSecret != "" {
 		return nil // credentials already live inside the named secret.
+	}
+	if c.MetadataStore == "quack" {
+		return prepareQuack(db)
 	}
 	if !c.isS3() {
 		return nil
@@ -309,7 +324,8 @@ func registerConnectionFlags(cmd *cobra.Command, cfg *ConnectionConfig) {
 	cmd.Flags().StringVarP(&cfg.CatalogName, "catalog", "c", "wh", "Catalog alias used inside DuckDB")
 	cmd.Flags().StringVar(&cfg.DucklakeSecret, "ducklake-secret", "", "Name of a pre-created persistent DUCKLAKE secret (see 'parkbench secrets create-ducklake'); when set, all other connection flags below are ignored")
 	cmd.Flags().StringVar(&cfg.MetadataCatalogName, "metadata-catalog-name", "", "Expose DuckLake's metadata tables under this name in DuckDB (METADATA_CATALOG); omit to keep them hidden")
-	cmd.Flags().StringVar(&cfg.MetadataStore, "metadata-store", "postgres", "Metadata store backend: 'postgres' or 'duckdb' (ignored when --ducklake-secret is set)")
+	cmd.Flags().StringVar(&cfg.MetadataStore, "metadata-store", "postgres", "Metadata store backend: 'postgres', 'duckdb', or 'quack' (a local DuckDB catalog through `parkbench quack-serve`; token in "+quackTokenEnv+"); ignored when --ducklake-secret is set")
+	cmd.Flags().StringVar(&cfg.QuackURI, "quack-uri", defaultQuackURI, "The local Quack server serving the catalog (--metadata-store quack only)")
 	cmd.Flags().StringVar(&cfg.PgDSN, "pg-dsn", "dbname=ducklake_v1 host=localhost", "Postgres DSN for the metadata store; works for local Postgres or a remote/managed Postgres such as Supabase, e.g. \"host=db.xxxx.supabase.co port=5432 dbname=postgres user=postgres password=... sslmode=require\" (postgres mode only)")
 	cmd.Flags().StringVar(&cfg.PgDSNFile, "pg-dsn-file", "", "Path to a file containing the Postgres DSN, keeping credentials out of shell history; mutually exclusive with --pg-dsn. Supports # comments and one key per line")
 	cmd.Flags().StringVar(&cfg.MetadataSchema, "metadata-schema", "", "Postgres schema DuckLake stores its metadata tables in (METADATA_SCHEMA); defaults to Postgres 'public' if unset (postgres mode only)")
@@ -400,7 +416,9 @@ func printConnectionSummary(cfg ConnectionConfig) {
 		return
 	}
 
-	if cfg.MetadataStore == "duckdb" {
+	if cfg.MetadataStore == "quack" {
+		fmt.Printf("  Metadata store : %sDuckDB via Quack%s (%s%s%s)\n", green, reset, green, cfg.QuackURI, reset)
+	} else if cfg.MetadataStore == "duckdb" {
 		dataPath := cfg.DataPath
 		if dataPath == "" {
 			dataPath = "."
@@ -430,7 +448,9 @@ func printConnectionSummary(cfg ConnectionConfig) {
 // ── reset ─────────────────────────────────────────────────────────────────
 
 func runReset(cfg ConnectionConfig, force bool) error {
-	remote := cfg.isRemote()
+	// Through Quack the server holds the catalog file open, so it can't be deleted: its
+	// tables are dropped instead, as for a remote catalog.
+	remote := cfg.isRemote() || cfg.MetadataStore == "quack"
 
 	if !force {
 		fmt.Printf("%s%sWARNING:%s This will permanently delete:\n", bold, yellow, reset)
