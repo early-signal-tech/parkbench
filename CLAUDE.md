@@ -42,6 +42,10 @@ ATTACH 'ducklake:ducklake_prod' AS wh (METADATA_CATALOG 'ducklake_prod_meta')
 
 The DuckLake spec version of a new catalog is fixed by the embedded DuckDB's `ducklake` extension; there is no ATTACH option to pick it. parkbench embeds DuckDB 2.0 (`duckdb-go/v2 v2.20000.0`), so `setup` creates **DuckLake 1.1** catalogs. Older (1.0) catalogs still attach and stay on 1.0 unless `--migrate` is passed. Migration is deliberately opt-in: upgrading a shared catalog (e.g. prod) can lock out older DuckLake clients. `catalogVersion()` reads the version from `ducklake_metadata`; `setup` and `run` print it.
 
+### Quack: a local DuckDB catalog shared by several processes
+
+`--metadata-store quack` attaches `ducklake:<--quack-uri>` (default `quack:localhost:9495`) instead of the `.ducklake` file, through a server started with `parkbench quack-serve` (`quack.go`), which opens `<data-path>/<catalog>.ducklake` as its main database and calls `quack_serve`. The token is read only from `PARKBENCH_QUACK_TOKEN` (`prepareQuack` creates a temporary `TYPE quack` secret with it); errors pass through `withoutToken`. `--quack-uri` must be a localhost URI (`checkQuackURI`). `checkMetadataStore` validates the store for setup, reset and run. Reset through Quack takes the remote path (drop tables, re-setup), since the server holds the file. Quack in DuckDB 2.0 doesn't forward `?` parameters, so SQL sent through it must stay literal (it already is here). Throughput through Quack is roughly 20–25% below direct; see the README. PB-1 (duck-harness-app, via cli-bridge's pb1-serve) runs its local catalog this way so its QUERY terminal can read while runs write.
+
 ## DuckDB Secrets
 
 Parkbench can create and consume DuckDB's persistent secrets (`CREATE PERSISTENT SECRET`), matching the pattern from [DuckLake in Production: Catalog and Storage](https://thefulldatastack.substack.com/p/ducklake-in-production-catalog-storage):
@@ -98,7 +102,7 @@ Creates the `events`, `events_rich`, and `events_rejected` tables inside the Duc
 | `--catalog`, `-c` | `wh` | Catalog alias used inside DuckDB SQL |
 | `--ducklake-secret` | _(none)_ | Name of a pre-created persistent `DUCKLAKE` secret; when set, all flags below are ignored |
 | `--metadata-catalog-name` | _(none)_ | Expose DuckLake's metadata tables under this name in DuckDB (`METADATA_CATALOG`) |
-| `--metadata-store` | `postgres` | Metadata store backend: `postgres` or `duckdb` (ignored with `--ducklake-secret`) |
+| `--metadata-store` | `postgres` | Metadata store backend: `postgres`, `duckdb`, or `quack` (ignored with `--ducklake-secret`) |
 | `--pg-dsn` | `dbname=ducklake_v1 host=localhost` | Postgres DSN for the metadata store — local or remote/managed, e.g. Supabase |
 | `--metadata-schema` | _(none)_ | Postgres schema for DuckLake's metadata tables (`METADATA_SCHEMA`); defaults to `public` |
 | `--data-path` | `./ducklake_data` | Where Parquet files are written: a local directory, or an `s3://bucket/prefix` URI |
@@ -153,7 +157,7 @@ Inserts rows continuously and prints throughput stats.
 | `--catalog`, `-c` | `wh` | Catalog alias |
 | `--ducklake-secret` | _(none)_ | Name of a pre-created persistent `DUCKLAKE` secret; when set, connection flags below are ignored |
 | `--metadata-catalog-name` | _(none)_ | Expose DuckLake's metadata tables under this name in DuckDB (`METADATA_CATALOG`) |
-| `--metadata-store` | `postgres` | Metadata store backend: `postgres` or `duckdb` (ignored with `--ducklake-secret`) |
+| `--metadata-store` | `postgres` | Metadata store backend: `postgres`, `duckdb`, or `quack` (ignored with `--ducklake-secret`) |
 | `--pg-dsn` | `dbname=ducklake_v1 host=localhost` | Postgres DSN — local or remote/managed, e.g. Supabase |
 | `--metadata-schema` | _(none)_ | Postgres schema for DuckLake's metadata tables (`METADATA_SCHEMA`); defaults to `public` |
 | `--data-path` | `./ducklake_data` | Parquet data directory: a local directory, or an `s3://bucket/prefix` URI |

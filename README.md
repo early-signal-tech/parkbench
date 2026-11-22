@@ -194,7 +194,7 @@ parkbench setup --ducklake-secret ducklake_prod
 | `--catalog`, `-c` | `wh` | Catalog alias used inside DuckDB SQL |
 | `--ducklake-secret` | _(none)_ | Name of a pre-created persistent `DUCKLAKE` secret; when set, all flags below are ignored |
 | `--metadata-catalog-name` | _(none)_ | Expose DuckLake's metadata tables under this name in DuckDB (`METADATA_CATALOG`) |
-| `--metadata-store` | `postgres` | Metadata store backend: `postgres` or `duckdb` (ignored with `--ducklake-secret`) |
+| `--metadata-store` | `postgres` | Metadata store backend: `postgres`, `duckdb`, or `quack` (see [Sharing a local DuckDB catalog](#sharing-a-local-duckdb-catalog-quack)) (ignored with `--ducklake-secret`) |
 | `--pg-dsn` | `dbname=ducklake_v1 host=localhost` | Postgres DSN — local or remote/managed, e.g. Supabase (postgres mode only) |
 | `--metadata-schema` | _(none)_ | Postgres schema for DuckLake's metadata tables (`METADATA_SCHEMA`); defaults to `public` (postgres mode only) |
 | `--data-path` | `./ducklake_data` | Where Parquet files are written: a local directory, or an `s3://bucket/prefix` URI |
@@ -246,7 +246,7 @@ parkbench run --ducklake-secret ducklake_prod --num-batches 0
 | `--catalog`, `-c` | `wh` | Catalog alias |
 | `--ducklake-secret` | _(none)_ | Name of a pre-created persistent `DUCKLAKE` secret; when set, connection flags below are ignored |
 | `--metadata-catalog-name` | _(none)_ | Expose DuckLake's metadata tables under this name in DuckDB (`METADATA_CATALOG`) |
-| `--metadata-store` | `postgres` | Metadata store backend: `postgres` or `duckdb` (ignored with `--ducklake-secret`) |
+| `--metadata-store` | `postgres` | Metadata store backend: `postgres`, `duckdb`, or `quack` (see [Sharing a local DuckDB catalog](#sharing-a-local-duckdb-catalog-quack)) (ignored with `--ducklake-secret`) |
 | `--pg-dsn` | `dbname=ducklake_v1 host=localhost` | Postgres DSN — local or remote/managed, e.g. Supabase (postgres mode only) |
 | `--metadata-schema` | _(none)_ | Postgres schema for DuckLake's metadata tables (`METADATA_SCHEMA`); defaults to `public` (postgres mode only) |
 | `--data-path` | `./ducklake_data` | Parquet data directory: a local directory, or an `s3://bucket/prefix` URI |
@@ -297,6 +297,26 @@ parkbench run --run-mode ticker --tick-interval 0.5 --duration 30 --schema-drift
 ```
 
 A run that fails exits non-zero with `Error: ...` on stderr and no `done` event.
+
+### Sharing a local DuckDB catalog (Quack)
+
+DuckDB lets one process open a database file for writing, so a local DuckDB catalog (`--metadata-store duckdb`) can't be queried from the `duckdb` CLI while a run writes to it: one gets "Could not set lock on file". `parkbench quack-serve` fixes that. It opens the catalog file and serves it over [Quack](https://duckdb.org/docs/2.0/quack/overview), DuckDB 2.0's server protocol, on localhost, and runs and readers attach through it:
+
+```bash
+export PARKBENCH_QUACK_TOKEN=$(openssl rand -hex 16)   # the server's token: never a flag
+parkbench quack-serve &                                # serves ./ducklake_data/wh.ducklake on quack:localhost:9495
+parkbench setup --metadata-store quack
+parkbench run   --metadata-store quack --run-mode ticker --duration 300 &
+
+# meanwhile, in another terminal (same folder, same token):
+duckdb -cmd "LOAD quack; CREATE SECRET (TYPE quack, TOKEN '$PARKBENCH_QUACK_TOKEN');
+             ATTACH 'ducklake:quack:localhost:9495' AS wh (DATA_PATH './ducklake_data/'); USE wh;"
+```
+
+- Run everything from the same folder: the catalog stores `--data-path` as given.
+- The server is local-only (`--quack-uri quack:localhost:<port>`), and the token comes only from `PARKBENCH_QUACK_TOKEN`, so it isn't in the process list. A wrong token is refused.
+- `reset --metadata-store quack` drops and recreates the tables. The server holds the catalog file open, so it isn't deleted, and Parquet files already written stay.
+- **It costs some speed.** Measured on an M-series Mac: batch inserts of 100k rows ran at about 3.0M rows/s through Quack against 3.7–4.0M direct, and 0.01s ticks managed about 81 a second against 96. Benchmark the direct `duckdb` store when you need the top number; use Quack when you need to query while it runs.
 
 ### `reset` — Drop and recreate the catalog
 
