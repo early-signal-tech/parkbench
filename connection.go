@@ -133,6 +133,16 @@ func attachOption(key, value string) string {
 	return fmt.Sprintf("%s %s", key, sqlStringLiteral(value))
 }
 
+// attachStatement builds an ATTACH, leaving off the option list when it's empty: DuckDB
+// rejects `AS wh ()`, which a named secret with no other options used to send.
+func attachStatement(target, alias, options string) string {
+	statement := fmt.Sprintf("ATTACH '%s' AS %s", target, alias)
+	if options == "" {
+		return statement
+	}
+	return statement + " (" + options + ")"
+}
+
 func joinAttachOptions(opts ...string) string {
 	var nonEmpty []string
 	for _, o := range opts {
@@ -180,7 +190,7 @@ func quoteIdent(s string) string {
 // via prepareConnection first.
 func (c ConnectionConfig) buildAttachSQL() string {
 	if c.DucklakeSecret != "" {
-		return fmt.Sprintf("ATTACH 'ducklake:%s' AS %s (%s)", c.DucklakeSecret, c.CatalogName,
+		return attachStatement("ducklake:"+c.DucklakeSecret, c.CatalogName,
 			joinAttachOptions(
 				c.migrationOption(),
 				attachOption("METADATA_CATALOG", c.MetadataCatalogName),
@@ -193,7 +203,7 @@ func (c ConnectionConfig) buildAttachSQL() string {
 	}
 
 	if c.MetadataStore == "quack" {
-		return fmt.Sprintf("ATTACH 'ducklake:%s' AS %s (%s)", c.QuackURI, c.CatalogName,
+		return attachStatement("ducklake:"+c.QuackURI, c.CatalogName,
 			joinAttachOptions(
 				attachOption("DATA_PATH", dataPath),
 				c.migrationOption(),
@@ -202,14 +212,14 @@ func (c ConnectionConfig) buildAttachSQL() string {
 
 	if c.MetadataStore == "duckdb" {
 		catalogFile := filepath.Join(dataPath, c.CatalogName+".ducklake")
-		return fmt.Sprintf("ATTACH 'ducklake:duckdb:%s' AS %s (%s)", catalogFile, c.CatalogName,
+		return attachStatement("ducklake:duckdb:"+catalogFile, c.CatalogName,
 			joinAttachOptions(
 				attachOption("DATA_PATH", dataPath),
 				c.migrationOption(),
 			))
 	}
 
-	return fmt.Sprintf("ATTACH 'ducklake:postgres:%s' AS %s (%s)", c.PgDSN, c.CatalogName,
+	return attachStatement("ducklake:postgres:"+c.PgDSN, c.CatalogName,
 		joinAttachOptions(
 			attachOption("DATA_PATH", dataPath),
 			c.migrationOption(),
